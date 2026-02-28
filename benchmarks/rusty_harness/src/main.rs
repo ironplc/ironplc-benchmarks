@@ -115,7 +115,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn compute_report(args: &Args, durations_ns: &mut Vec<u64>) -> BenchReport {
+fn compute_report(args: &Args, durations_ns: &mut [u64]) -> BenchReport {
     durations_ns.sort_unstable();
     let n = durations_ns.len();
     let sum: u64 = durations_ns.iter().sum();
