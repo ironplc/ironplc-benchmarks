@@ -1,3 +1,11 @@
+# Rust build artifacts
+target/
+*.rlib
+
+# Benchmark output
+results/
+out/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
