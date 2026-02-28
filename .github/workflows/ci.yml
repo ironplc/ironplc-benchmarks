@@ -25,6 +25,34 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  build-harness:
+    name: Build benchmark harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            benchmarks/rusty_harness/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('benchmarks/rusty_harness/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build rusty-harness
+        working-directory: benchmarks/rusty_harness
+        run: cargo build --release
+
+      - name: Run cargo clippy
+        working-directory: benchmarks/rusty_harness
+        run: cargo clippy -- -D warnings
+
   lint:
     name: Lint Python
     runs-on: ubuntu-latest
