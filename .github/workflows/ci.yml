@@ -21,9 +21,15 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: ironplc-bench:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Compile ST programs to shared libraries
+        run: |
+          docker run --rm -v "$PWD":/workspace ironplc-bench:ci \
+            bash benchmarks/build_libs.sh
 
   build-harness:
     name: Build benchmark harness
@@ -54,7 +60,7 @@ jobs:
         run: cargo clippy -- -D warnings
 
   lint:
-    name: Lint Python
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,3 +77,6 @@ jobs:
 
       - name: Ruff format check
         run: ruff format --check .
+
+      - name: ShellCheck
+        run: shellcheck benchmarks/*.sh
