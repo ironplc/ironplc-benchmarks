@@ -22,7 +22,7 @@ struct Args {
     #[arg(long)]
     entry: String,
 
-    /// Symbol name of the initializer function (e.g. "__init__blinky")
+    /// Symbol name of the initializer function (e.g. "__init___blinky_st")
     #[arg(long)]
     init: Option<String>,
 
@@ -76,8 +76,10 @@ fn main() -> Result<()> {
             .with_context(|| format!("Failed to load library: {}", args.lib.display()))?
     };
 
-    // Call the initializer if provided. RuSTy emits __init__<program> which
-    // sets up global variables; it must run before the entry point.
+    // Call the initializer if provided. RuSTy emits __init___<filename> (triple
+    // underscore, filename with dots replaced by underscores) which sets up
+    // global variables. On x86, constructors run automatically at dlopen, but
+    // we call it explicitly for cross-platform consistency.
     if let Some(ref init_sym) = args.init {
         let init: Symbol<unsafe extern "C" fn()> = unsafe {
             lib.get(init_sym.as_bytes())
