@@ -7,7 +7,7 @@
 #   ./benchmarks/build_libs.sh blinky.st        # Compile one program
 #
 # Requires: plc (RuSTy compiler) on PATH.
-# Output:   out/<name>_O0.so, out/<name>_O2.so for each program.
+# Output:   out/<name>_0.so, out/<name>_2.so for each program.
 
 set -euo pipefail
 
@@ -19,8 +19,8 @@ OUT_DIR="${SCRIPT_DIR}/../out"
 #   -Onone       → LLVM O0 (unoptimized baseline)
 #   -Odefault    → LLVM O2 (production-optimized)
 declare -A OPT_LEVELS=(
-    ["O0"]="-Onone"
-    ["O2"]="-Odefault"
+    ["0"]="-Onone"
+    ["2"]="-Odefault"
 )
 
 mkdir -p "${OUT_DIR}"
