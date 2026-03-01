@@ -9,6 +9,8 @@ FROM python:3.12-bookworm
 
 ARG LLVM_VER=21
 ARG RUST_VERSION=1.90.0
+ARG IRONPLC_REV=92b6e39
+ARG RUSTY_REV=ebf72fb
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -54,6 +56,21 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
     && rustc --version && cargo --version
+
+# ------------------------------------------------------------
+# IronPLC compiler and VM (built from source for flexibility)
+# Pinned to a specific commit for reproducibility.
+# ------------------------------------------------------------
+RUN cargo install --git https://github.com/ironplc/ironplc --rev ${IRONPLC_REV} ironplcc \
+    && cargo install --git https://github.com/ironplc/ironplc --rev ${IRONPLC_REV} ironplc-vm-cli \
+    && ironplcc --version && ironplcvm --version
+
+# ------------------------------------------------------------
+# RuSTy IEC 61131-3 compiler (plc binary)
+# Pinned to a specific commit for reproducibility.
+# ------------------------------------------------------------
+RUN cargo install --git https://github.com/PLC-lang/rusty --rev ${RUSTY_REV} plc_driver \
+    && plc --version
 
 # ------------------------------------------------------------
 # Python tooling

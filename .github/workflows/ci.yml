@@ -53,6 +53,15 @@ jobs:
         working-directory: benchmarks/rusty_harness
         run: cargo clippy -- -D warnings
 
+  lint-shell:
+    name: Lint shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: shellcheck benchmarks/*.sh
+
   lint:
     name: Lint Python
     runs-on: ubuntu-latest

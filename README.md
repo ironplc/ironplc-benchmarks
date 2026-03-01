@@ -15,8 +15,10 @@ benchmarks/
   rusty_harness/     # Rust binary that loads RuSTy-compiled .so files
     Cargo.toml
     src/main.rs
+  run_benchmark.sh   # Run one program through both IronPLC and RuSTy
+  run_all.sh         # Run all programs
   results/           # Generated at runtime (git-ignored)
-Dockerfile           # Dev container with Python 3, Rust, and LLVM 21
+Dockerfile           # Dev container with Python 3, Rust, LLVM 21, ironplcc, ironplcvm, plc
 PLAN.md              # Detailed benchmarking plan and paper outline
 ```
 
@@ -24,7 +26,7 @@ PLAN.md              # Detailed benchmarking plan and paper outline
 
 **Option A — Docker (recommended)**
 
-Build and run the development container, which includes Python 3.12, Rust, and LLVM 21:
+Build and run the development container, which includes Python 3.12, Rust, LLVM 21, `ironplcc`, `ironplcvm`, and `plc` (RuSTy):
 
 ```bash
 docker build -t ironplc-bench .
@@ -108,6 +110,32 @@ The harness emits a JSON report to stdout:
 }
 ```
 
+## Running benchmarks
+
+The quickest way to run the full suite through both IronPLC and RuSTy is inside the Docker container:
+
+```bash
+# Build the RuSTy harness first
+cd benchmarks/rusty_harness && cargo build --release && cd ../..
+
+# Run all programs
+./benchmarks/run_all.sh
+
+# Or run a single program
+./benchmarks/run_benchmark.sh benchmarks/programs/blinky.st
+```
+
+Results are written to `results/<name>/` with three JSON files per program:
+- `ironplc.json` — IronPLC bytecode VM timing
+- `rusty_0.json` — RuSTy with `-Onone` (LLVM O0)
+- `rusty_2.json` — RuSTy with `-Odefault` (LLVM O2)
+
+You can control the number of cycles via environment variables:
+
+```bash
+CYCLES=100000 WARMUP=5000 ./benchmarks/run_all.sh
+```
+
 ## Benchmark programs
 
 | Program | Description | Key features exercised |
@@ -120,10 +148,11 @@ The harness emits a JSON report to stdout:
 
 ## CI
 
-GitHub Actions runs on every push to `main` and `claude/**` branches, and on pull requests to `main`. The workflow includes three jobs:
+GitHub Actions runs on every push to `main` and `claude/**` branches, and on pull requests to `main`. The workflow includes four jobs:
 
-- **Build Docker image** — verifies the development container builds successfully
+- **Build Docker image** — verifies the development container builds successfully (includes `ironplcc`, `ironplcvm`, and `plc`)
 - **Build benchmark harness** — compiles `rusty-harness` in release mode and runs `cargo clippy`
+- **Lint shell scripts** — runs ShellCheck on `benchmarks/*.sh`
 - **Lint Python** — runs `ruff check` and `ruff format --check`
 
 ## Linting
@@ -132,6 +161,9 @@ GitHub Actions runs on every push to `main` and `claude/**` branches, and on pul
 # Rust
 cd benchmarks/rusty_harness
 cargo clippy -- -D warnings
+
+# Shell
+shellcheck benchmarks/*.sh
 
 # Python
 ruff check .
