@@ -937,8 +937,9 @@ benchmarks/
     compare_outputs.py
     report.py
     summary_table.py
-  run_benchmark.py             # Component 4
-  run_all.py
+  run_benchmark.py             # Component 4 — single program
+  run_all.py                   # Component 4 — full suite
+  run_e2e.py                   # E2E pipeline (CI and local)
   README.md                    # Reproduction instructions for paper reviewers
   results/                     # Generated at runtime — in .gitignore
     .gitkeep
@@ -997,13 +998,26 @@ cargo build --release --manifest-path benchmarks/matiec_harness/Cargo.toml
 pip install tabulate
 ```
 
-### Run Full Suite
+### Quick E2E Test
+
+```bash
+# Verify the full pipeline works (compile → run → validate → compare):
+python benchmarks/run_e2e.py
+
+# Fewer cycles for a fast smoke test:
+python benchmarks/run_e2e.py --cycles 100 --warmup 10
+
+# Single program only:
+python benchmarks/run_e2e.py --programs blinky
+```
+
+### Run Full Suite (Paper)
 
 ```bash
 python benchmarks/run_all.py
 ```
 
-### Run Single Program
+### Run Single Program (Paper)
 
 ```bash
 python benchmarks/run_benchmark.py benchmarks/programs/blinky.st
@@ -1021,47 +1035,62 @@ python benchmarks/run_benchmark.py benchmarks/programs/blinky.st
 
 ## 11. CI Pipeline
 
-### 11.1 Purpose
+### 11.1 Design: `run_e2e.py`
 
-The GitHub Actions workflow (`.github/workflows/benchmark.yml`) runs the entire benchmark pipeline on every push. Performance numbers on shared CI runners are not meaningful — the goal is to verify the end-to-end pipeline:
+All pipeline logic lives in **`benchmarks/run_e2e.py`** — a standalone Python script that runs identically locally and in CI. The GitHub Actions workflow (`.github/workflows/benchmark.yml`) only handles toolchain installation, then calls this script.
 
-1. **Get code** — checkout the repository
-2. **Install compilers** — RuSTy (LLVM backend), MATIEC (`iec2c` + GCC), IronPLC (when available)
-3. **Build harnesses** — compile `rusty-harness` and `matiec-harness`
-4. **Compile ST programs** — every `.st` file with every available compiler at `-O0` and `-O2`
-5. **Execute** — run each compiled program through its harness (reduced cycle count: 1,000 measured, 100 warmup)
-6. **Validate output format** — verify every JSON result file has the required structure (`program`, `opt_level`, `cycles`, `warmup`, `durations_us` with `mean`/`p50`/`p99`/`min`/`max`)
-7. **Compare results** — print side-by-side timing tables and compare final variable state across compilers (when `--capture-output` is available)
-8. **Upload artifacts** — store results and compiled `.so` files for 30 days
+```bash
+# Locally (after installing compilers and building harnesses):
+python benchmarks/run_e2e.py
+
+# With options:
+python benchmarks/run_e2e.py --cycles 10000 --warmup 1000
+python benchmarks/run_e2e.py --programs blinky arithmetic
+```
+
+The script auto-discovers which compilers and harnesses are available, then runs through five stages:
+
+1. **Discover** — check for `plc`, `iec2c`, `ironplcc` on PATH and harness binaries
+2. **Compile** — every `.st` file with every available compiler at `-O0` and `-O2`
+3. **Execute** — run each compiled program through its harness
+4. **Validate** — verify every JSON result has required keys (`program`, `opt_level`, `cycles`, `warmup`, `durations_us.{mean,p50,p99,min,max}`) and sane values
+5. **Compare** — print side-by-side timing table; compare final variable state across compilers (when capture files exist)
 
 ### 11.2 Graceful Degradation
 
-The workflow is designed to work incrementally as components are implemented:
+The script works incrementally. If only `plc` + `rusty-harness` are available, it runs just the RuSTy pipeline. As MATIEC and IronPLC components are added, they automatically participate:
 
-| Component | Status | CI behavior |
+| Component | Detection | Behavior when missing |
 |---|---|---|
-| RuSTy harness | Implemented | Compiles and runs all programs |
-| MATIEC harness | Planned | Gated on `matiec_harness/Cargo.toml` existing |
-| `matiec_compile.sh` | Planned | Gated on file existing; `continue-on-error` for dialect failures |
-| `ironplcc bench` | Planned | Gated on `ironplcc` being on `PATH` |
-| `--capture-output` | Planned | Final-state comparison skipped until capture files exist |
+| `plc` (RuSTy) | `which plc` | **Required** — script exits |
+| `rusty-harness` | binary exists | **Required** — script exits |
+| `iec2c` + `matiec_compile.sh` | `which iec2c` + file exists | Skips MATIEC compilation |
+| `matiec-harness` | binary exists | Skips MATIEC execution |
+| `ironplcc` | `which ironplcc` | Skips IronPLC compilation + execution |
+| `--capture-output` | `*_vars.json` files exist | Skips final-state comparison |
 
-Each compiler's steps use `continue-on-error: true` or existence checks so that a failure in one compiler does not block the others. The validation step always runs and fails the build if any produced JSON is malformed.
+### 11.3 GitHub Actions Workflow
 
-### 11.3 Caching
+The workflow (`.github/workflows/benchmark.yml`) handles only toolchain setup:
 
-Expensive build artifacts are cached across runs:
+1. Install system packages, LLVM 21, Rust, Python
+2. Install RuSTy and MATIEC (with caching by pinned commit)
+3. Build harnesses
+4. **`python benchmarks/run_e2e.py --cycles 1000 --warmup 100`**
+5. Upload `results/` as artifacts
+
+Performance numbers on CI runners are not meaningful — the goal is verifying the pipeline works end-to-end.
+
+### 11.4 Caching
+
+Expensive build artifacts are cached across CI runs:
 
 - **LLVM 21 packages** — keyed by LLVM version and runner OS
-- **RuSTy binary** (`~/.cargo/bin/plc`) — keyed by the pinned RuSTy commit
-- **MATIEC** (`/opt/matiec/`) — keyed by the pinned MATIEC commit
-- **Cargo registry and build artifacts** — keyed by `Cargo.lock` hashes
+- **RuSTy binary** (`~/.cargo/bin/plc`) — keyed by pinned commit
+- **MATIEC** (`/opt/matiec/`) — keyed by pinned commit
+- **Cargo build artifacts** — keyed by `Cargo.lock` hashes
 
-After the first run, subsequent runs skip the slow compiler-installation steps entirely.
-
-### 11.4 Trigger
-
-The workflow runs on:
+### 11.5 Trigger
 
 - Push to `main` or any `claude/**` branch
 - Pull requests targeting `main`

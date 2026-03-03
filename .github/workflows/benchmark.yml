@@ -1,28 +1,21 @@
 name: Benchmark E2E
 
-# End-to-end benchmark pipeline: compile ST programs with every available
-# compiler, execute via harnesses, validate JSON output format, and compare
-# final variable state across compilers.
-#
+# Runs the end-to-end benchmark pipeline via benchmarks/run_e2e.py.
 # Performance numbers on shared CI runners are NOT meaningful — the goal is
-# to verify the full pipeline (get code → compile → execute → validate →
-# compare) on every push.
+# to verify: get code → compile → execute → validate output → compare.
 
 on:
   push:
     branches: [main, "claude/**"]
   pull_request:
     branches: [main]
-  workflow_dispatch: # allow manual trigger
+  workflow_dispatch:
 
 env:
-  # Pin compiler versions for reproducibility.  Update these when upgrading.
+  # Pin compiler versions for reproducibility.
   LLVM_VER: "21"
   RUSTY_REV: "main" # TODO: pin to a specific commit hash
   MATIEC_REV: "master" # TODO: pin to a specific commit hash
-  # Reduced cycle counts for CI — we care about correctness, not perf.
-  BENCH_CYCLES: "1000"
-  BENCH_WARMUP: "100"
 
 jobs:
   benchmark:
@@ -31,10 +24,9 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # ── 1. Get code ─────────────────────────────────────────
       - uses: actions/checkout@v4
 
-      # ── 2. System dependencies ──────────────────────────────
+      # ── Toolchain setup ─────────────────────────────────────
       - name: Install system packages
         run: |
           sudo apt-get update
@@ -44,8 +36,7 @@ jobs:
             zlib1g-dev libzstd-dev wget gnupg \
             lsb-release software-properties-common
 
-      # ── 3. LLVM (required by RuSTy) ────────────────────────
-      - name: Cache LLVM ${{ env.LLVM_VER }} packages
+      - name: Cache LLVM ${{ env.LLVM_VER }}
         id: cache-llvm
         uses: actions/cache@v4
         with:
@@ -64,61 +55,44 @@ jobs:
           echo "/usr/lib/llvm-${{ env.LLVM_VER }}/bin" >> "$GITHUB_PATH"
           echo "LLVM_SYS_${{ env.LLVM_VER }}1_PREFIX=/usr/lib/llvm-${{ env.LLVM_VER }}" >> "$GITHUB_ENV"
 
-      # ── 4. Rust toolchain ───────────────────────────────────
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      # ── 5. Python ───────────────────────────────────────────
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # ── 6. Install RuSTy compiler ──────────────────────────
-      - name: Cache RuSTy compiler binary
+      # ── Install compilers ───────────────────────────────────
+      - name: Cache RuSTy binary
         id: cache-rusty
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/plc
           key: rusty-${{ env.RUSTY_REV }}-${{ runner.os }}-${{ runner.arch }}
 
-      - name: Build and install RuSTy
+      - name: Install RuSTy
         if: steps.cache-rusty.outputs.cache-hit != 'true'
-        run: |
-          cargo install \
-            --git https://github.com/PLC-lang/rusty \
-            --rev ${{ env.RUSTY_REV }} \
-            plc
+        run: cargo install --git https://github.com/PLC-lang/rusty --rev ${{ env.RUSTY_REV }} plc
 
-      - name: Verify RuSTy
-        run: plc --version || plc --help | head -5
-
-      # ── 7. Install MATIEC compiler ─────────────────────────
-      - name: Cache MATIEC compiler
+      - name: Cache MATIEC
         id: cache-matiec
         uses: actions/cache@v4
         with:
           path: /opt/matiec
           key: matiec-${{ env.MATIEC_REV }}-${{ runner.os }}-${{ runner.arch }}
 
-      - name: Build and install MATIEC
+      - name: Install MATIEC
         if: steps.cache-matiec.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/sm1820/matiec.git /opt/matiec
-          cd /opt/matiec
-          autoreconf -i
-          ./configure
-          make -j"$(nproc)"
+          cd /opt/matiec && autoreconf -i && ./configure && make -j"$(nproc)"
 
-      - name: Configure MATIEC environment
+      - name: Add MATIEC to PATH
         run: |
           echo "/opt/matiec" >> "$GITHUB_PATH"
           echo "MATIEC_C_INCLUDE_PATH=/opt/matiec/lib/C" >> "$GITHUB_ENV"
 
-      - name: Verify MATIEC
-        run: iec2c --help 2>&1 | head -5 || echo "iec2c installed"
-
-      # ── 8. Build harnesses ─────────────────────────────────
-      - name: Cache harness build artifacts
+      # ── Build harnesses ─────────────────────────────────────
+      - name: Cache harness builds
         uses: actions/cache@v4
         with:
           path: |
@@ -129,284 +103,21 @@ jobs:
           key: harness-${{ runner.os }}-${{ hashFiles('benchmarks/rusty_harness/Cargo.lock', 'benchmarks/matiec_harness/Cargo.lock') }}
           restore-keys: harness-${{ runner.os }}-
 
-      - name: Build rusty-harness
-        run: cargo build --release --manifest-path benchmarks/rusty_harness/Cargo.toml
-
-      - name: Build matiec-harness
-        if: hashFiles('benchmarks/matiec_harness/Cargo.toml') != ''
-        run: cargo build --release --manifest-path benchmarks/matiec_harness/Cargo.toml
-
-      # ── 9. Compile ST programs ─────────────────────────────
-      - name: Compile all programs with RuSTy
+      - name: Build harnesses
         run: |
-          mkdir -p out
-          for f in benchmarks/programs/*.st; do
-            name=$(basename "$f" .st)
-            echo "::group::$name"
-            echo "  -O0..."
-            plc "$f" --shared -o "out/${name}_O0.so"
-            echo "  -O2..."
-            plc "$f" --shared -O2 -o "out/${name}_O2.so"
-            echo "::endgroup::"
-          done
-          echo "Compiled $(ls out/*.so | wc -l) shared libraries"
-
-      - name: Compile all programs with MATIEC
-        continue-on-error: true # dialect differences may cause some to fail
-        run: |
-          if [ ! -f benchmarks/matiec_compile.sh ]; then
-            echo "matiec_compile.sh not yet implemented — skipping"
-            exit 0
-          fi
-          for f in benchmarks/programs/*.st; do
-            name=$(basename "$f" .st)
-            echo "::group::$name"
-            ./benchmarks/matiec_compile.sh "$f" O0 "out/${name}_matiec_O0.so" \
-              && echo "  -O0 OK" || echo "  -O0 SKIP (incompatible)"
-            ./benchmarks/matiec_compile.sh "$f" O2 "out/${name}_matiec_O2.so" \
-              && echo "  -O2 OK" || echo "  -O2 SKIP (incompatible)"
-            echo "::endgroup::"
-          done
-
-      # ── 10. Run benchmarks ─────────────────────────────────
-      - name: Run RuSTy benchmarks
-        run: |
-          for f in benchmarks/programs/*.st; do
-            name=$(basename "$f" .st)
-            mkdir -p "results/$name"
-
-            # Discover entry/init symbols from the .so
-            ENTRY=$(nm -D "out/${name}_O0.so" \
-              | awk '$2 == "T" && $3 !~ /^_/ { print $3; exit }')
-            INIT=$(nm -D "out/${name}_O0.so" \
-              | awk '$2 == "T" && $3 ~ /__init__/ { print $3; exit }')
-            INIT_ARG=""
-            [ -n "$INIT" ] && INIT_ARG="--init $INIT"
-
-            echo "::group::$name"
-            for opt in O0 O2; do
-              echo "  RuSTy -${opt}..."
-              ./benchmarks/rusty_harness/target/release/rusty-harness \
-                --lib "out/${name}_${opt}.so" \
-                --entry "$ENTRY" $INIT_ARG \
-                --cycles "$BENCH_CYCLES" --warmup "$BENCH_WARMUP" \
-                --opt-level "$opt" \
-                > "results/${name}/rusty_${opt}.json"
-            done
-            echo "::endgroup::"
-          done
-
-      - name: Run MATIEC benchmarks
-        if: hashFiles('benchmarks/matiec_harness/Cargo.toml') != ''
-        continue-on-error: true
-        run: |
-          HARNESS=benchmarks/matiec_harness/target/release/matiec-harness
-          [ -x "$HARNESS" ] || { echo "matiec-harness not built — skipping"; exit 0; }
-
-          for f in benchmarks/programs/*.st; do
-            name=$(basename "$f" .st)
-            so="out/${name}_matiec_O2.so"
-            [ -f "$so" ] || continue
-            mkdir -p "results/$name"
-
-            echo "::group::$name"
-            for opt in O0 O2; do
-              so="out/${name}_matiec_${opt}.so"
-              [ -f "$so" ] || continue
-              echo "  MATIEC -${opt}..."
-              "$HARNESS" \
-                --lib "$so" \
-                --cycles "$BENCH_CYCLES" --warmup "$BENCH_WARMUP" \
-                --opt-level "$opt" \
-                > "results/${name}/matiec_${opt}.json"
-            done
-            echo "::endgroup::"
-          done
-
-      - name: Run IronPLC benchmarks
-        continue-on-error: true
-        run: |
-          if ! command -v ironplcc &>/dev/null; then
-            echo "ironplcc not installed — skipping IronPLC benchmarks"
-            exit 0
+          cargo build --release --manifest-path benchmarks/rusty_harness/Cargo.toml
+          if [ -f benchmarks/matiec_harness/Cargo.toml ]; then
+            cargo build --release --manifest-path benchmarks/matiec_harness/Cargo.toml
           fi
 
-          for f in benchmarks/programs/*.st; do
-            name=$(basename "$f" .st)
-            mkdir -p "results/$name"
+      # ── Run pipeline ────────────────────────────────────────
+      - name: Run E2E benchmark pipeline
+        run: python benchmarks/run_e2e.py --cycles 1000 --warmup 100
 
-            echo "::group::$name"
-            ironplcc compile "$f" -o "out/${name}.plc"
-            ironplcc bench "out/${name}.plc" \
-              --cycles "$BENCH_CYCLES" --warmup "$BENCH_WARMUP" \
-              --report-format json \
-              > "results/${name}/ironplc.json"
-            echo "::endgroup::"
-          done
-
-      # ── 11. Validate JSON output format ────────────────────
-      - name: Validate output format
-        run: |
-          python3 << 'PYEOF'
-          import json, glob, sys
-
-          REQUIRED = {"program", "opt_level", "cycles", "warmup", "durations_us"}
-          DURATION_KEYS = {"mean", "p50", "p99", "min", "max"}
-
-          files = sorted(glob.glob("results/*/*.json"))
-          if not files:
-              print("ERROR: no result files found")
-              sys.exit(1)
-
-          ok = True
-          for path in files:
-              with open(path) as f:
-                  try:
-                      data = json.load(f)
-                  except json.JSONDecodeError as e:
-                      print(f"FAIL {path}: invalid JSON — {e}")
-                      ok = False
-                      continue
-
-              missing = REQUIRED - set(data.keys())
-              if missing:
-                  print(f"FAIL {path}: missing top-level keys {missing}")
-                  ok = False
-                  continue
-
-              dur = data.get("durations_us", {})
-              dur_missing = DURATION_KEYS - set(dur.keys())
-              if dur_missing:
-                  print(f"FAIL {path}: missing duration keys {dur_missing}")
-                  ok = False
-                  continue
-
-              # Sanity: durations should be non-negative numbers
-              for k in DURATION_KEYS:
-                  v = dur[k]
-                  if not isinstance(v, (int, float)) or v < 0:
-                      print(f"FAIL {path}: durations_us.{k} = {v!r} (expected non-negative number)")
-                      ok = False
-                      break
-              else:
-                  print(
-                      f"OK   {path:45s}  "
-                      f"mean={dur['mean']:8.2f}µs  "
-                      f"p99={dur['p99']:8.2f}µs  "
-                      f"max={dur['max']:8.2f}µs"
-                  )
-
-          print(f"\n{'─' * 60}")
-          print(f"Validated {len(files)} files: {'ALL PASSED' if ok else 'FAILURES DETECTED'}")
-          sys.exit(0 if ok else 1)
-          PYEOF
-
-      # ── 12. Compare results across compilers ───────────────
-      - name: Compare results across compilers
-        run: |
-          python3 << 'PYEOF'
-          import json, glob, sys
-          from pathlib import Path
-
-          programs = sorted(set(
-              Path(p).parent.name for p in glob.glob("results/*/*.json")
-          ))
-
-          print(f"Programs with results: {', '.join(programs)}\n")
-
-          for prog in programs:
-              result_dir = Path("results") / prog
-              files = sorted(result_dir.glob("*.json"))
-              if len(files) < 2:
-                  print(f"  {prog}: only {len(files)} result(s) — need ≥2 to compare, skipping")
-                  continue
-
-              print(f"  {prog}:")
-
-              # Load timing data from each compiler/opt combination
-              entries = []
-              for f in files:
-                  with open(f) as fh:
-                      data = json.load(fh)
-                  dur = data["durations_us"]
-                  label = f.stem  # e.g. "rusty_O0", "matiec_O2", "ironplc"
-                  entries.append((label, dur))
-
-              # Print side-by-side timing comparison
-              print(f"    {'label':20s} {'mean':>10s} {'p50':>10s} {'p99':>10s} {'max':>10s}")
-              for label, dur in entries:
-                  print(
-                      f"    {label:20s} "
-                      f"{dur['mean']:9.2f}µs "
-                      f"{dur['p50']:9.2f}µs "
-                      f"{dur['p99']:9.2f}µs "
-                      f"{dur['max']:9.2f}µs"
-                  )
-
-              # Compute overhead ratios if we have both RuSTy -O2 and another compiler
-              rusty_o2 = next(
-                  (dur for label, dur in entries if label == "rusty_O2"), None
-              )
-              if rusty_o2 and rusty_o2["mean"] > 0:
-                  print("    ──")
-                  for label, dur in entries:
-                      if label == "rusty_O2":
-                          continue
-                      ratio = dur["mean"] / rusty_o2["mean"]
-                      print(f"    {label} vs rusty_O2: {ratio:.1f}x (mean)")
-
-              print()
-
-          # ── Compare final variable state (when capture files exist) ──
-          var_programs = [
-              prog for prog in programs
-              if len(list((Path("results") / prog).glob("*_vars.json"))) >= 2
-          ]
-
-          if var_programs:
-              print("─" * 60)
-              print("Final-state comparison:\n")
-              all_pass = True
-              for prog in var_programs:
-                  var_files = sorted((Path("results") / prog).glob("*_vars.json"))
-                  data = {}
-                  for vf in var_files:
-                      with open(vf) as fh:
-                          data[vf.stem] = json.load(fh)
-
-                  names = list(data.keys())
-                  ref_name, ref_data = names[0], data[names[0]]
-                  for other_name in names[1:]:
-                      other_data = data[other_name]
-                      mismatches = [
-                          (var, ref_data[var], other_data.get(var))
-                          for var in ref_data
-                          if ref_data[var] != other_data.get(var)
-                      ]
-                      if mismatches:
-                          all_pass = False
-                          print(f"  FAIL  {prog}: {ref_name} vs {other_name}")
-                          for var, exp, act in mismatches:
-                              print(f"        {var}: {exp} vs {act}")
-                      else:
-                          count = len(ref_data)
-                          print(f"  PASS  {prog}: {ref_name} vs {other_name} ({count} vars)")
-
-              if not all_pass:
-                  sys.exit(1)
-          else:
-              print("No variable capture files found — final-state comparison skipped.")
-              print("(This will run once harnesses support --capture-output)")
-
-          PYEOF
-
-      # ── 13. Upload artifacts ────────────────────────────────
-      - name: Upload benchmark results
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results-${{ github.sha }}
-          path: |
-            results/
-            out/*.so
+          path: results/
           retention-days: 30
