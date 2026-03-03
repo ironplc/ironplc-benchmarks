@@ -1048,8 +1048,9 @@ python benchmarks/run_e2e.py --cycles 10000 --warmup 1000
 python benchmarks/run_e2e.py --programs blinky arithmetic
 ```
 
-The script auto-discovers which compilers and harnesses are available, then runs through five stages:
+The script handles **everything** after toolchain installation — including building harnesses from source — then runs through six stages:
 
+0. **Build** — `cargo build --release` for each harness whose `Cargo.toml` exists but binary is missing (skips if already built)
 1. **Discover** — check for `plc`, `iec2c`, `ironplcc` on PATH and harness binaries
 2. **Compile** — every `.st` file with every available compiler at `-O0` and `-O2`
 3. **Execute** — run each compiled program through its harness
@@ -1063,7 +1064,7 @@ The script works incrementally. If only `plc` + `rusty-harness` are available, i
 | Component | Detection | Behavior when missing |
 |---|---|---|
 | `plc` (RuSTy) | `which plc` | **Required** — script exits |
-| `rusty-harness` | binary exists | **Required** — script exits |
+| `rusty-harness` | binary exists (auto-built if `Cargo.toml` present) | **Required** — script exits |
 | `iec2c` + `matiec_compile.sh` | `which iec2c` + file exists | Skips MATIEC compilation |
 | `matiec-harness` | binary exists | Skips MATIEC execution |
 | `ironplcc` | `which ironplcc` | Skips IronPLC compilation + execution |
@@ -1071,13 +1072,12 @@ The script works incrementally. If only `plc` + `rusty-harness` are available, i
 
 ### 11.3 GitHub Actions Workflow
 
-The workflow (`.github/workflows/benchmark.yml`) handles only toolchain setup:
+The workflow (`.github/workflows/benchmark.yml`) handles only toolchain setup — `run_e2e.py` does the rest:
 
 1. Install system packages, LLVM 21, Rust, Python
 2. Install RuSTy and MATIEC (with caching by pinned commit)
-3. Build harnesses
-4. **`python benchmarks/run_e2e.py --cycles 1000 --warmup 100`**
-5. Upload `results/` as artifacts
+3. **`python benchmarks/run_e2e.py --cycles 1000 --warmup 100`** (builds harnesses, compiles, executes, validates, compares)
+4. Upload `results/` as artifacts
 
 Performance numbers on CI runners are not meaningful — the goal is verifying the pipeline works end-to-end.
 

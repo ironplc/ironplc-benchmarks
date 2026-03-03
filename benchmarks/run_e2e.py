@@ -2,7 +2,7 @@
 """
 End-to-end benchmark pipeline.
 
-Discovers available compilers and harnesses, compiles all ST programs,
+Builds harnesses, discovers available compilers, compiles all ST programs,
 runs benchmarks, validates JSON output format, and compares results.
 Works identically locally and in CI.
 
@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import shutil
 import subprocess
@@ -65,6 +64,34 @@ def discover_rusty_symbols(so_path: Path) -> tuple[str, str | None]:
 
 
 # ── Pipeline stages ─────────────────────────────────────────────────
+
+
+HARNESSES = [
+    ("rusty-harness", Path("benchmarks/rusty_harness")),
+    ("matiec-harness", Path("benchmarks/matiec_harness")),
+]
+
+
+def build_harnesses() -> None:
+    """Build Rust harnesses from source if the binary is missing but Cargo.toml exists."""
+    for name, crate_dir in HARNESSES:
+        cargo_toml = crate_dir / "Cargo.toml"
+        binary = crate_dir / "target" / "release" / name
+        if binary.exists():
+            print(f"  {name:20s} already built")
+            continue
+        if not cargo_toml.exists():
+            print(f"  {name:20s} no Cargo.toml — skipping")
+            continue
+        print(f"  {name:20s} building...")
+        r = run(
+            ["cargo", "build", "--release", "--manifest-path", str(cargo_toml)],
+        )
+        if r.returncode != 0:
+            print(f"  WARN: failed to build {name}")
+        else:
+            print(f"  {name:20s} done")
+    print()
 
 
 def discover_environment() -> dict:
@@ -397,6 +424,12 @@ def main():
     print(f"Programs: {', '.join(f.stem for f in st_files)}")
     print(f"Cycles: {args.cycles}  Warmup: {args.warmup}")
     print()
+
+    # ── 0. Build ──────────────────────────────────────────────────
+    print("=" * 60)
+    print("BUILD HARNESSES")
+    print("=" * 60)
+    build_harnesses()
 
     # ── 1. Discover ──────────────────────────────────────────────
     env = discover_environment()

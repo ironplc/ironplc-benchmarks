@@ -91,8 +91,8 @@ jobs:
           echo "/opt/matiec" >> "$GITHUB_PATH"
           echo "MATIEC_C_INCLUDE_PATH=/opt/matiec/lib/C" >> "$GITHUB_ENV"
 
-      # ── Build harnesses ─────────────────────────────────────
-      - name: Cache harness builds
+      # ── Cargo cache for harness builds (done by run_e2e.py) ──
+      - name: Cache Cargo artifacts
         uses: actions/cache@v4
         with:
           path: |
@@ -103,14 +103,7 @@ jobs:
           key: harness-${{ runner.os }}-${{ hashFiles('benchmarks/rusty_harness/Cargo.lock', 'benchmarks/matiec_harness/Cargo.lock') }}
           restore-keys: harness-${{ runner.os }}-
 
-      - name: Build harnesses
-        run: |
-          cargo build --release --manifest-path benchmarks/rusty_harness/Cargo.toml
-          if [ -f benchmarks/matiec_harness/Cargo.toml ]; then
-            cargo build --release --manifest-path benchmarks/matiec_harness/Cargo.toml
-          fi
-
-      # ── Run pipeline ────────────────────────────────────────
+      # ── Run pipeline (builds harnesses, compiles, executes, validates) ──
       - name: Run E2E benchmark pipeline
         run: python benchmarks/run_e2e.py --cycles 1000 --warmup 100
 
