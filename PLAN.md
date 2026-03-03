@@ -18,7 +18,8 @@
 8. [Component 6 — Report Generator](#8-component-6--report-generator)
 9. [Repository Layout](#9-repository-layout)
 10. [Build and Run Instructions](#10-build-and-run-instructions)
-11. [Paper Section Outline](#11-paper-section-outline)
+11. [CI Pipeline](#11-ci-pipeline)
+12. [Paper Section Outline](#12-paper-section-outline)
 
 ---
 
@@ -950,6 +951,11 @@ benchmarks/
       ironplc.json
     ...                        # One directory per benchmark program
 
+.github/
+  workflows/
+    ci.yml                     # Build harnesses, lint Python
+    benchmark.yml              # End-to-end benchmark pipeline
+
 compiler/
   ironplcc/
     src/
@@ -1013,7 +1019,57 @@ python benchmarks/run_benchmark.py benchmarks/programs/blinky.st
 
 ---
 
-## 11. Paper Section Outline
+## 11. CI Pipeline
+
+### 11.1 Purpose
+
+The GitHub Actions workflow (`.github/workflows/benchmark.yml`) runs the entire benchmark pipeline on every push. Performance numbers on shared CI runners are not meaningful — the goal is to verify the end-to-end pipeline:
+
+1. **Get code** — checkout the repository
+2. **Install compilers** — RuSTy (LLVM backend), MATIEC (`iec2c` + GCC), IronPLC (when available)
+3. **Build harnesses** — compile `rusty-harness` and `matiec-harness`
+4. **Compile ST programs** — every `.st` file with every available compiler at `-O0` and `-O2`
+5. **Execute** — run each compiled program through its harness (reduced cycle count: 1,000 measured, 100 warmup)
+6. **Validate output format** — verify every JSON result file has the required structure (`program`, `opt_level`, `cycles`, `warmup`, `durations_us` with `mean`/`p50`/`p99`/`min`/`max`)
+7. **Compare results** — print side-by-side timing tables and compare final variable state across compilers (when `--capture-output` is available)
+8. **Upload artifacts** — store results and compiled `.so` files for 30 days
+
+### 11.2 Graceful Degradation
+
+The workflow is designed to work incrementally as components are implemented:
+
+| Component | Status | CI behavior |
+|---|---|---|
+| RuSTy harness | Implemented | Compiles and runs all programs |
+| MATIEC harness | Planned | Gated on `matiec_harness/Cargo.toml` existing |
+| `matiec_compile.sh` | Planned | Gated on file existing; `continue-on-error` for dialect failures |
+| `ironplcc bench` | Planned | Gated on `ironplcc` being on `PATH` |
+| `--capture-output` | Planned | Final-state comparison skipped until capture files exist |
+
+Each compiler's steps use `continue-on-error: true` or existence checks so that a failure in one compiler does not block the others. The validation step always runs and fails the build if any produced JSON is malformed.
+
+### 11.3 Caching
+
+Expensive build artifacts are cached across runs:
+
+- **LLVM 21 packages** — keyed by LLVM version and runner OS
+- **RuSTy binary** (`~/.cargo/bin/plc`) — keyed by the pinned RuSTy commit
+- **MATIEC** (`/opt/matiec/`) — keyed by the pinned MATIEC commit
+- **Cargo registry and build artifacts** — keyed by `Cargo.lock` hashes
+
+After the first run, subsequent runs skip the slow compiler-installation steps entirely.
+
+### 11.4 Trigger
+
+The workflow runs on:
+
+- Push to `main` or any `claude/**` branch
+- Pull requests targeting `main`
+- Manual trigger via `workflow_dispatch`
+
+---
+
+## 12. Paper Section Outline
 
 ---
 
@@ -1115,11 +1171,12 @@ Build in this sequence. Each step produces something independently useful and un
 |Step|Component|Deliverable|Unblocks|
 |---|---|---|---|
 |1|`ironplcc bench` (timing only)|Can measure IronPLC cycle time|Everything else|
-|2|RuSTy harness binary|Can measure RuSTy cycle time|Steps 4–9|
-|3|MATIEC harness + `matiec_compile.sh`|Can measure MATIEC cycle time|Steps 4–9|
-|4|`run_benchmark.py`|Single command runs all three|Paper workflow|
-|5|`--capture-output` + `compare_outputs.py`|Final-state correctness verification|Section 5.4|
-|6|`report.py` + `summary_table.py`|Paper tables (three-way comparison)|Section 5.5|
-|7|Benchmark programs 6–8|Broader evaluation|Stronger paper|
-|8|MATIEC compatibility testing|Verify which programs compile on MATIEC|Accurate results table|
-|9|`README.md` + `SOURCES.md` + pinned commits|Reproducibility|Submission|
+|2|RuSTy harness binary|Can measure RuSTy cycle time|Steps 4–10|
+|3|MATIEC harness + `matiec_compile.sh`|Can measure MATIEC cycle time|Steps 4–10|
+|4|CI pipeline (`benchmark.yml`)|E2E verification on every push|Continuous validation|
+|5|`run_benchmark.py`|Single command runs all three|Paper workflow|
+|6|`--capture-output` + `compare_outputs.py`|Final-state correctness verification|Section 5.4|
+|7|`report.py` + `summary_table.py`|Paper tables (three-way comparison)|Section 5.5|
+|8|Benchmark programs 6–8|Broader evaluation|Stronger paper|
+|9|MATIEC compatibility testing|Verify which programs compile on MATIEC|Accurate results table|
+|10|`README.md` + `SOURCES.md` + pinned commits|Reproducibility|Submission|
