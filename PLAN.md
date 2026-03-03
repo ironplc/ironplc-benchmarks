@@ -29,20 +29,17 @@ The benchmark compares three execution paths for the **same ST source file**:
 ```
 traffic_light.st
      │
-     ├─── RuSTy (plc) ──────► native .so ──► rusty_harness ──► T_rusty_{O0,O2}.json
+     ├─► RuSTy (plc) ──────► native .so ──► rusty_harness ──► timing.json + final_vars.json
      │
-     ├─── MATIEC (iec2c) ────► C source ──► GCC ──► native .so ──► matiec_harness ──► T_matiec_{O0,O2}.json
+     ├─► MATIEC (iec2c) ────► C source ──► GCC ──► .so ──► matiec_harness ──► timing.json + final_vars.json
      │
-     └─── IronPLC (ironplcc) ► .plc container ► ironplcc bench ► T_ironplc.json
-                                                      │
-                                                      └──────────► variables.json
-                                                                       │
-                                                      rusty_vars.json ─┘
-                                                    matiec_vars.json ─┘
-                                                                       │
-                                                               compare_outputs.py
-                                                                       │
-                                                              PASS / FAIL + diff
+     └─► IronPLC (ironplcc) ► .plc ──► ironplcc bench ──► timing.json + final_vars.json
+                                                                    │
+                                              all final_vars.json ──┘
+                                                                    │
+                                                         compare_outputs.py
+                                                                    │
+                                                         PASS / FAIL + diff
 ```
 
 **Why MATIEC?** MATIEC (`iec2c`) is the open-source IEC 61131-3 compiler used by OpenPLC. It translates ST to ANSI C, which is then compiled to native code by GCC. Including MATIEC provides a second native-code baseline alongside RuSTy, representing the traditional C-compilation approach common in industrial PLC runtimes. This three-way comparison isolates the performance characteristics of: (a) LLVM-optimized native code (RuSTy), (b) GCC-compiled C code from a mature transpiler (MATIEC), and (c) bytecode interpretation (IronPLC).
@@ -57,16 +54,20 @@ Each program must be verified: it must compile and run correctly on RuSTy before
 
 ### 2.1 Suite
 
-|#|Name|Source|Key Features Exercised|
-|---|---|---|---|
-|1|`blinky.st`|OpenPLC examples|Minimal coil/contact; baseline|
-|2|`ton_oneshot.st`|RuSTy test suite|TON timer, stateful FB|
-|3|`counter_up.st`|RuSTy test suite|CTU counter, reset semantics|
-|4|`arithmetic.st`|Custom / OSCAT|ADD, SUB, MUL, DIV, MOD, LIMIT|
-|5|`for_loop.st`|RuSTy test suite|FOR loop, accumulator|
-|6|`case_state.st`|OpenPLC examples|CASE statement, state machine|
-|7|`nested_fb.st`|RuSTy test suite|FB calling FB, multiple instances|
-|8|`array_sort.st`|Custom|Array indexing, bubble sort|
+Each program is designed so that its final variable state after N cycles is **deterministic and analytically predictable**, enabling correctness verification across compilers without runtime introspection.
+
+|#|Name|Source|Key Features Exercised|Expected Final State (11,000 cycles)|
+|---|---|---|---|---|
+|1|`blinky.st`|OpenPLC examples|Minimal coil/contact; baseline|`output_coil = FALSE` (even cycle count)|
+|2|`ton_oneshot.st`|RuSTy test suite|TON timer, stateful FB|Timer elapsed, output latched|
+|3|`counter_up.st`|RuSTy test suite|CTU counter, reset semantics|`counter = 11000`|
+|4|`arithmetic.st`|Custom / OSCAT|ADD, SUB, MUL, DIV, MOD, LIMIT|Deterministic computed values|
+|5|`for_loop.st`|RuSTy test suite|FOR loop, accumulator|`accumulator = 5050` (sum 1..100 each cycle)|
+|6|`case_state.st`|OpenPLC examples|CASE statement, state machine|`state` determined by `11000 mod 4`|
+|7|`nested_fb.st`|RuSTy test suite|FB calling FB, multiple instances|Deterministic FB instance state|
+|8|`array_sort.st`|Custom|Array indexing, bubble sort|Sorted array, deterministic final values|
+
+> **Note:** "11,000 cycles" = 1,000 warmup + 10,000 measured (default). The expected final state column shows what all compilers must agree on to pass the correctness check.
 
 ### 2.2 Selection Rationale
 
@@ -547,200 +548,324 @@ If a benchmark program cannot compile on MATIEC due to dialect differences, it w
 
 ### 6.1 What It Does
 
-Orchestrates the full pipeline for a single ST source file: compile with all three toolchains, run all harnesses, compare outputs, emit a combined report. Designed to be called from CI or manually during paper preparation.
+Orchestrates the full pipeline for a single ST source file: compile with all three toolchains, run all harnesses, verify correctness by comparing final output state, emit a combined report. Written in Python for portability and to share data structures with the report generators. Designed to be called from CI or manually during paper preparation.
 
 ### 6.2 Where It Lives
 
 ```
-benchmarks/run_benchmark.sh
-benchmarks/run_all.sh
+benchmarks/run_benchmark.py
+benchmarks/run_all.py
 ```
 
-### 6.3 `run_benchmark.sh`
+### 6.3 `run_benchmark.py`
 
-```bash
-#!/usr/bin/env bash
-# Usage: ./benchmarks/run_benchmark.sh benchmarks/programs/blinky.st
-set -euo pipefail
+```python
+#!/usr/bin/env python3
+"""
+Run the full benchmark pipeline for a single ST source file.
 
-ST_FILE="$1"
-NAME="$(basename "$ST_FILE" .st)"
-CYCLES="${CYCLES:-10000}"
-WARMUP="${WARMUP:-1000}"
-TICK_US="${TICK_US:-1000}"
-SKIP_MATIEC="${SKIP_MATIEC:-false}"
-OUT="results/$NAME"
-mkdir -p "$OUT" out/
+Usage: python benchmarks/run_benchmark.py benchmarks/programs/blinky.st
+       python benchmarks/run_benchmark.py --skip-matiec benchmarks/programs/ton_oneshot.st
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
-echo "── $NAME ──────────────────────────────────────────"
 
-# 1. Compile with RuSTy at both optimization levels
-echo "[1/9] RuSTy O0..."
-plc "$ST_FILE" --shared -o "out/${NAME}_O0.so"
+def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    print(f"  $ {' '.join(cmd)}")
+    return subprocess.run(cmd, check=True, **kwargs)
 
-echo "[2/9] RuSTy O2..."
-plc "$ST_FILE" --shared -O2 -o "out/${NAME}_O2.so"
 
-# 2. Compile with MATIEC at both optimization levels
-if [ "$SKIP_MATIEC" != "true" ]; then
-  echo "[3/9] MATIEC O0..."
-  ./benchmarks/matiec_compile.sh "$ST_FILE" O0 "out/${NAME}_matiec_O0.so"
+def discover_rusty_symbols(so_path: str) -> tuple[str, str | None]:
+    """Use nm to find the entry point and optional init symbol in a RuSTy .so."""
+    result = subprocess.run(
+        ["nm", "-D", so_path], capture_output=True, text=True, check=True
+    )
+    entry, init = None, None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[1] == "T":
+            sym = parts[2]
+            if "__init__" in sym:
+                init = sym
+            elif not sym.startswith("_"):
+                entry = entry or sym
+    if not entry:
+        sys.exit(f"Could not find entry symbol in {so_path}")
+    return entry, init
 
-  echo "[4/9] MATIEC O2..."
-  ./benchmarks/matiec_compile.sh "$ST_FILE" O2 "out/${NAME}_matiec_O2.so"
-else
-  echo "[3/9] MATIEC O0... SKIPPED"
-  echo "[4/9] MATIEC O2... SKIPPED"
-fi
 
-# 3. Compile with IronPLC
-echo "[5/9] IronPLC compile..."
-ironplcc compile "$ST_FILE" -o "out/${NAME}.plc"
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark a single ST program")
+    parser.add_argument("st_file", type=Path, help="Path to .st source file")
+    parser.add_argument("--cycles", type=int, default=10_000)
+    parser.add_argument("--warmup", type=int, default=1_000)
+    parser.add_argument("--tick-us", type=int, default=1_000)
+    parser.add_argument("--skip-matiec", action="store_true")
+    args = parser.parse_args()
 
-# 4. Discover RuSTy symbols
-ENTRY="$(nm -D "out/${NAME}_O0.so" | awk '/T [^_]/ {print $3}' | head -1)"
-INIT="$(nm -D  "out/${NAME}_O0.so" | awk '/T __init__/ {print $3}' | head -1)"
+    name = args.st_file.stem
+    out = Path("results") / name
+    out.mkdir(parents=True, exist_ok=True)
+    Path("out").mkdir(exist_ok=True)
 
-# 5. Run harnesses
-echo "[6/9] RuSTy O0 run..."
-./benchmarks/rusty_harness/target/release/rusty-harness \
-  --lib "out/${NAME}_O0.so" --entry "$ENTRY" --init "$INIT" \
-  --cycles "$CYCLES" --warmup "$WARMUP" --opt-level O0 \
-  > "$OUT/rusty_O0.json"
+    steps = 9 if not args.skip_matiec else 5
+    step = 0
 
-echo "[7/9] RuSTy O2 run..."
-./benchmarks/rusty_harness/target/release/rusty-harness \
-  --lib "out/${NAME}_O2.so" --entry "$ENTRY" --init "$INIT" \
-  --cycles "$CYCLES" --warmup "$WARMUP" --opt-level O2 \
-  > "$OUT/rusty_O2.json"
+    def log(msg: str):
+        nonlocal step
+        step += 1
+        print(f"[{step}/{steps}] {msg}")
 
-if [ "$SKIP_MATIEC" != "true" ]; then
-  echo "[8/9] MATIEC O0 run..."
-  ./benchmarks/matiec_harness/target/release/matiec-harness \
-    --lib "out/${NAME}_matiec_O0.so" \
-    --cycles "$CYCLES" --warmup "$WARMUP" --opt-level O0 \
-    > "$OUT/matiec_O0.json"
+    # ── Compile ──────────────────────────────────────────────
+    log("RuSTy -O0 compile")
+    run(["plc", str(args.st_file), "--shared", "-o", f"out/{name}_O0.so"])
 
-  echo "[8/9] MATIEC O2 run..."
-  ./benchmarks/matiec_harness/target/release/matiec-harness \
-    --lib "out/${NAME}_matiec_O2.so" \
-    --cycles "$CYCLES" --warmup "$WARMUP" --opt-level O2 \
-    > "$OUT/matiec_O2.json"
-else
-  echo "[8/9] MATIEC runs... SKIPPED"
-fi
+    log("RuSTy -O2 compile")
+    run(["plc", str(args.st_file), "--shared", "-O2", "-o", f"out/{name}_O2.so"])
 
-echo "[9/9] IronPLC run..."
-ironplcc bench "out/${NAME}.plc" \
-  --cycles "$CYCLES" --warmup "$WARMUP" --tick-us "$TICK_US" \
-  --capture-output "$OUT/ironplc_vars.json" \
-  --report-format json \
-  > "$OUT/ironplc.json"
+    if not args.skip_matiec:
+        log("MATIEC -O0 compile")
+        run(["./benchmarks/matiec_compile.sh", str(args.st_file), "O0",
+             f"out/{name}_matiec_O0.so"])
 
-# 6. Correctness check
-python3 benchmarks/tools/compare_outputs.py \
-  "$OUT/rusty_vars.json" \
-  "$OUT/ironplc_vars.json"
+        log("MATIEC -O2 compile")
+        run(["./benchmarks/matiec_compile.sh", str(args.st_file), "O2",
+             f"out/{name}_matiec_O2.so"])
 
-# 7. Combined report
-MATIEC_ARGS=""
-if [ "$SKIP_MATIEC" != "true" ]; then
-  MATIEC_ARGS="--matiec-O0 $OUT/matiec_O0.json --matiec-O2 $OUT/matiec_O2.json"
-fi
+    log("IronPLC compile")
+    run(["ironplcc", "compile", str(args.st_file), "-o", f"out/{name}.plc"])
 
-python3 benchmarks/tools/report.py \
-  --name "$NAME" \
-  --rusty-O0 "$OUT/rusty_O0.json" \
-  --rusty-O2 "$OUT/rusty_O2.json" \
-  --ironplc  "$OUT/ironplc.json" \
-  $MATIEC_ARGS
+    # ── Run harnesses ────────────────────────────────────────
+    entry, init = discover_rusty_symbols(f"out/{name}_O0.so")
+    init_args = ["--init", init] if init else []
 
-echo "Done. Results in $OUT/"
+    for opt in ("O0", "O2"):
+        log(f"RuSTy -{opt} run")
+        result = run(
+            ["./benchmarks/rusty_harness/target/release/rusty-harness",
+             "--lib", f"out/{name}_{opt}.so",
+             "--entry", entry, *init_args,
+             "--cycles", str(args.cycles), "--warmup", str(args.warmup),
+             "--opt-level", opt,
+             "--capture-output", str(out / f"rusty_{opt}_vars.json")],
+            capture_output=True, text=True,
+        )
+        (out / f"rusty_{opt}.json").write_text(result.stdout)
+
+    if not args.skip_matiec:
+        for opt in ("O0", "O2"):
+            log(f"MATIEC -{opt} run")
+            result = run(
+                ["./benchmarks/matiec_harness/target/release/matiec-harness",
+                 "--lib", f"out/{name}_matiec_{opt}.so",
+                 "--cycles", str(args.cycles), "--warmup", str(args.warmup),
+                 "--opt-level", opt,
+                 "--capture-output", str(out / f"matiec_{opt}_vars.json")],
+                capture_output=True, text=True,
+            )
+            (out / f"matiec_{opt}.json").write_text(result.stdout)
+
+    log("IronPLC run")
+    result = run(
+        ["ironplcc", "bench", f"out/{name}.plc",
+         "--cycles", str(args.cycles), "--warmup", str(args.warmup),
+         "--tick-us", str(args.tick_us),
+         "--capture-output", str(out / "ironplc_vars.json"),
+         "--report-format", "json"],
+        capture_output=True, text=True,
+    )
+    (out / "ironplc.json").write_text(result.stdout)
+
+    # ── Correctness check ────────────────────────────────────
+    print(f"\n── Correctness: {name} ──")
+    var_files = list(out.glob("*_vars.json"))
+    run(["python3", "benchmarks/tools/compare_outputs.py"] +
+        [str(f) for f in var_files])
+
+    # ── Report ───────────────────────────────────────────────
+    report_args = [
+        "python3", "benchmarks/tools/report.py",
+        "--name", name,
+        "--rusty-O0", str(out / "rusty_O0.json"),
+        "--rusty-O2", str(out / "rusty_O2.json"),
+        "--ironplc", str(out / "ironplc.json"),
+    ]
+    if not args.skip_matiec:
+        report_args += [
+            "--matiec-O0", str(out / "matiec_O0.json"),
+            "--matiec-O2", str(out / "matiec_O2.json"),
+        ]
+    run(report_args)
+
+    print(f"\nDone. Results in {out}/")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-### 6.4 `run_all.sh`
+### 6.4 `run_all.py`
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+```python
+#!/usr/bin/env python3
+"""
+Run benchmarks for all programs in the suite.
 
-PROGRAMS=(
-  benchmarks/programs/blinky.st
-  benchmarks/programs/ton_oneshot.st
-  benchmarks/programs/counter_up.st
-  benchmarks/programs/arithmetic.st
-  benchmarks/programs/for_loop.st
-  benchmarks/programs/case_state.st
-)
+Usage: python benchmarks/run_all.py
+       python benchmarks/run_all.py --skip-matiec
+       python benchmarks/run_all.py --cycles 100000
+"""
+import argparse
+import subprocess
+import sys
+from pathlib import Path
 
-for prog in "${PROGRAMS[@]}"; do
-  ./benchmarks/run_benchmark.sh "$prog"
-done
+PROGRAMS = [
+    "benchmarks/programs/blinky.st",
+    "benchmarks/programs/ton_oneshot.st",
+    "benchmarks/programs/counter_up.st",
+    "benchmarks/programs/arithmetic.st",
+    "benchmarks/programs/for_loop.st",
+    "benchmarks/programs/case_state.st",
+]
 
-python3 benchmarks/tools/summary_table.py results/
+
+def main():
+    parser = argparse.ArgumentParser(description="Run all benchmarks")
+    parser.add_argument("--cycles", type=int, default=10_000)
+    parser.add_argument("--warmup", type=int, default=1_000)
+    parser.add_argument("--skip-matiec", action="store_true")
+    args = parser.parse_args()
+
+    failed = []
+    for prog in PROGRAMS:
+        print(f"\n{'═' * 60}")
+        print(f"  {prog}")
+        print(f"{'═' * 60}\n")
+        cmd = [
+            sys.executable, "benchmarks/run_benchmark.py", prog,
+            "--cycles", str(args.cycles),
+            "--warmup", str(args.warmup),
+        ]
+        if args.skip_matiec:
+            cmd.append("--skip-matiec")
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            failed.append(prog)
+
+    # Summary table across all programs
+    subprocess.run([
+        sys.executable, "benchmarks/tools/summary_table.py", "results/"
+    ])
+
+    if failed:
+        print(f"\nFailed programs: {', '.join(failed)}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
 
 ## 7. Component 5 — Output Capture and Comparison
 
-### 7.1 IronPLC Side
+### 7.1 Design Principle: Deterministic Final State
 
-Implemented via `--capture-output` in `ironplcc bench` (see Component 1). Serializes the final variable store to JSON after all measured cycles complete. This adds no overhead to the measurement loop — the write happens after the timing window closes.
+Each benchmark program is designed so that running it for a known number of cycles produces a **deterministic, analytically predictable final state**. Correctness is verified by checking that all three compilers (RuSTy, MATIEC, IronPLC) produce identical final variable values after the same total number of cycles (warmup + measured).
 
-### 7.2 RuSTy Side
+This approach is simple and compiler-agnostic — no companion inspection functions, no `dlsym` tricks, no compiler-specific introspection. Each harness runs the program, then captures the final state of all program variables to a JSON file. A Python script compares the JSON files across compilers.
 
-RuSTy-compiled programs hold state in memory accessible via the shared library's symbol table. The cleanest approach is to add a thin companion inspection function to each benchmark ST file that the harness calls after the measurement loop:
+Examples of deterministic final state:
 
-```iecst
-(* Appended to blinky.st — compiled into the same .so *)
-(* Harness calls blinky_get_outputs() after measurement *)
-FUNCTION blinky_get_outputs : BOOL
-VAR_EXTERNAL
-    output_coil : BOOL;
-    cycle_count : DINT;
-END_VAR
-    (* Variables are accessible via nm / dlsym in the harness *)
-END_FUNCTION
+| Program | Cycles | Expected final state |
+|---|---|---|
+| `counter_up.st` | 10,000 | `counter = 10000` |
+| `for_loop.st` | 10,000 | `accumulator = 5050` (each cycle computes sum 1..100) |
+| `arithmetic.st` | 10,000 | `result = <computed value>` (deterministic arithmetic) |
+| `blinky.st` | 10,000 | `output_coil = FALSE` (10000 is even → toggled back) |
+| `case_state.st` | 10,000 | `state = 2` (10000 mod 4 = 0, cycles through states 0→1→2→3→0…) |
+
+### 7.2 How Each Harness Captures Final State
+
+All three harnesses support a `--capture-output <PATH>` flag. After the measurement loop completes (timing window closed), the harness serializes the program's final variable values to JSON at the given path. This adds zero overhead to the measurement loop.
+
+**IronPLC:** `ironplcc bench --capture-output vars.json` serializes the VM's variable store after all cycles complete.
+
+**RuSTy harness:** After the measurement loop, the harness reads global variable addresses from the `.so` via `dlsym` (using symbols discovered by `nm -D`) and writes them to JSON.
+
+**MATIEC harness:** After the measurement loop, the harness reads the program instance struct from the `.so` via `dlsym` (MATIEC generates predictable global symbols like `__CONFIG0__`) and writes variable values to JSON.
+
+The JSON format is the same across all three:
+
+```json
+{
+  "counter": 10000,
+  "output_coil": false,
+  "accumulator": 5050
+}
 ```
 
-The harness discovers output variable addresses via `dlsym` and writes them to JSON. Alternatively, for the paper, correctness can be verified by checking only a representative subset of variables (the semantically meaningful outputs) rather than the full variable store.
+### 7.3 `compare_outputs.py`
 
-### 7.3 MATIEC Side
-
-MATIEC-compiled programs hold state in C global variables generated by `iec2c`. The generated code follows a predictable naming convention where program instance variables are accessible as struct fields. The MATIEC harness reads these after the measurement loop using `dlsym` to locate the program instance struct and serializes the output variables to JSON.
-
-### 7.4 `compare_outputs.py`
+Takes two or more variable JSON files and verifies they all agree. Compares every pair, reports any mismatches.
 
 ```python
 #!/usr/bin/env python3
 """
-Compare variable output JSON from RuSTy and IronPLC.
-Exit 0 on match, 1 on mismatch.
-Usage: compare_outputs.py rusty_vars.json ironplc_vars.json
-"""
-import json, sys
+Compare final variable state across compilers.
+All input files must contain identical variable values.
 
-def load(path):
+Usage: compare_outputs.py rusty_O2_vars.json matiec_O2_vars.json ironplc_vars.json
+"""
+import json
+import sys
+from pathlib import Path
+
+
+def load(path: str) -> dict:
     with open(path) as f:
         return json.load(f)
 
-rusty   = load(sys.argv[1])
-ironplc = load(sys.argv[2])
 
-mismatches = []
-for var, expected in rusty.items():
-    actual = ironplc.get(var)
-    if actual != expected:
-        mismatches.append((var, expected, actual))
+def main():
+    if len(sys.argv) < 3:
+        sys.exit("Usage: compare_outputs.py <file1.json> <file2.json> [file3.json ...]")
 
-if mismatches:
-    print("FAIL")
-    for var, exp, act in mismatches:
-        print(f"  {var}: expected={exp} actual={act}")
-    sys.exit(1)
+    files = sys.argv[1:]
+    data = {Path(f).stem: load(f) for f in files}
+    names = list(data.keys())
+    reference_name = names[0]
+    reference = data[reference_name]
 
-print(f"PASS  ({len(rusty)} variables verified)")
+    all_pass = True
+    for name in names[1:]:
+        other = data[name]
+        mismatches = []
+        for var, expected in reference.items():
+            actual = other.get(var)
+            if actual != expected:
+                mismatches.append((var, expected, actual))
+
+        if mismatches:
+            all_pass = False
+            print(f"FAIL  {reference_name} vs {name}")
+            for var, exp, act in mismatches:
+                print(f"  {var}: {reference_name}={exp}  {name}={act}")
+        else:
+            print(f"PASS  {reference_name} vs {name}  ({len(reference)} variables)")
+
+    sys.exit(0 if all_pass else 1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
@@ -811,8 +936,8 @@ benchmarks/
     compare_outputs.py
     report.py
     summary_table.py
-  run_benchmark.sh             # Component 4
-  run_all.sh
+  run_benchmark.py             # Component 4
+  run_all.py
   README.md                    # Reproduction instructions for paper reviewers
   results/                     # Generated at runtime — in .gitignore
     .gitkeep
@@ -869,13 +994,13 @@ pip install tabulate
 ### Run Full Suite
 
 ```bash
-./benchmarks/run_all.sh
+python benchmarks/run_all.py
 ```
 
 ### Run Single Program
 
 ```bash
-./benchmarks/run_benchmark.sh benchmarks/programs/blinky.st
+python benchmarks/run_benchmark.py benchmarks/programs/blinky.st
 ```
 
 ### Reproducibility Notes
@@ -883,8 +1008,8 @@ pip install tabulate
 - Results in `benchmarks/reference_results/` were collected on `<CPU>`, `<OS>`, kernel `<version>`.
 - Absolute timings vary by hardware. The overhead ratios (IronPLC p99 / RuSTy O2 p99, IronPLC p99 / MATIEC O2 p99) are expected to be stable across x86-64 platforms.
 - RuSTy was pinned to commit `<hash>`. MATIEC was pinned to commit `<hash>`. IronPLC was built from commit `<hash>`.
-- For lower variance, increase cycles: `CYCLES=100000 ./benchmarks/run_all.sh`
-- To skip MATIEC (e.g. if `iec2c` is not installed): `SKIP_MATIEC=true ./benchmarks/run_all.sh`
+- For lower variance, increase cycles: `python benchmarks/run_all.py --cycles 100000`
+- To skip MATIEC (e.g. if `iec2c` is not installed): `python benchmarks/run_all.py --skip-matiec`
 
 ---
 
@@ -927,7 +1052,7 @@ Programs 1–4 form the minimum set required to validate the VM's arithmetic and
 
 **Equivalence of measurement.** The IronPLC `bench` subcommand places `Instant::now()` calls outside `run_round`, so the VM executes identically to production. The RuSTy and MATIEC harnesses place equivalent timing calls outside the entry point call. All three harnesses use the same JSON report format; the summary table is generated by a single Python script consuming all results.
 
-**Correctness verification.** After each run, IronPLC's final variable state is compared element-wise against RuSTy's final variable state using `compare_outputs.py`. A program passes only if all output variables are identical.
+**Correctness verification.** Each benchmark program is designed so that its final variable state after a fixed number of cycles is deterministic and analytically predictable (e.g., a counter incremented once per cycle reaches exactly 11,000 after 11,000 total cycles; a state machine cycling through 4 states lands on a known state). After each run, each harness captures the final variable state to JSON. `compare_outputs.py` verifies that all compilers (RuSTy, MATIEC, IronPLC) produce identical final values. A program passes only if all output variables agree across every compiler.
 
 **Hardware.** `<CPU model, core count, clock speed>`, `<RAM>`, `<OS and version>`, kernel `<version>`.
 
@@ -992,8 +1117,8 @@ Build in this sequence. Each step produces something independently useful and un
 |1|`ironplcc bench` (timing only)|Can measure IronPLC cycle time|Everything else|
 |2|RuSTy harness binary|Can measure RuSTy cycle time|Steps 4–9|
 |3|MATIEC harness + `matiec_compile.sh`|Can measure MATIEC cycle time|Steps 4–9|
-|4|`run_benchmark.sh`|Single command runs all three|Paper workflow|
-|5|`--capture-output` + `compare_outputs.py`|Correctness verification|Section 5.4|
+|4|`run_benchmark.py`|Single command runs all three|Paper workflow|
+|5|`--capture-output` + `compare_outputs.py`|Final-state correctness verification|Section 5.4|
 |6|`report.py` + `summary_table.py`|Paper tables (three-way comparison)|Section 5.5|
 |7|Benchmark programs 6–8|Broader evaluation|Stronger paper|
 |8|MATIEC compatibility testing|Verify which programs compile on MATIEC|Accurate results table|
