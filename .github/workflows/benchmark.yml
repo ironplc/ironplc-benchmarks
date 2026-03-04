@@ -1,0 +1,116 @@
+name: Benchmark E2E
+
+# Runs the end-to-end benchmark pipeline via benchmarks/run_e2e.py.
+# Performance numbers on shared CI runners are NOT meaningful — the goal is
+# to verify: get code → compile → execute → validate output → compare.
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Pin compiler versions for reproducibility.
+  LLVM_VER: "21"
+  RUSTY_REV: "main" # TODO: pin to a specific commit hash
+  MATIEC_REV: "master" # TODO: pin to a specific commit hash
+
+jobs:
+  benchmark:
+    name: End-to-end benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Toolchain setup ─────────────────────────────────────
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            flex bison autoconf automake libtool \
+            zlib1g-dev libzstd-dev wget gnupg \
+            lsb-release software-properties-common
+
+      - name: Cache LLVM ${{ env.LLVM_VER }}
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: /usr/lib/llvm-${{ env.LLVM_VER }}
+          key: llvm-${{ env.LLVM_VER }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install LLVM ${{ env.LLVM_VER }}
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- ${{ env.LLVM_VER }}
+          sudo apt-get install -y --no-install-recommends \
+            libpolly-${{ env.LLVM_VER }}-dev
+
+      - name: Configure LLVM environment
+        run: |
+          echo "/usr/lib/llvm-${{ env.LLVM_VER }}/bin" >> "$GITHUB_PATH"
+          echo "LLVM_SYS_${{ env.LLVM_VER }}1_PREFIX=/usr/lib/llvm-${{ env.LLVM_VER }}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── Install compilers ───────────────────────────────────
+      - name: Cache RuSTy binary
+        id: cache-rusty
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/plc
+          key: rusty-${{ env.RUSTY_REV }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install RuSTy
+        if: steps.cache-rusty.outputs.cache-hit != 'true'
+        run: cargo install --git https://github.com/PLC-lang/rusty --rev ${{ env.RUSTY_REV }} plc
+
+      - name: Cache MATIEC
+        id: cache-matiec
+        uses: actions/cache@v4
+        with:
+          path: /opt/matiec
+          key: matiec-${{ env.MATIEC_REV }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install MATIEC
+        if: steps.cache-matiec.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/sm1820/matiec.git /opt/matiec
+          cd /opt/matiec && autoreconf -i && ./configure && make -j"$(nproc)"
+
+      - name: Add MATIEC to PATH
+        run: |
+          echo "/opt/matiec" >> "$GITHUB_PATH"
+          echo "MATIEC_C_INCLUDE_PATH=/opt/matiec/lib/C" >> "$GITHUB_ENV"
+
+      # ── Cargo cache for harness builds (done by run_e2e.py) ──
+      - name: Cache Cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            benchmarks/rusty_harness/target
+            benchmarks/matiec_harness/target
+          key: harness-${{ runner.os }}-${{ hashFiles('benchmarks/rusty_harness/Cargo.lock', 'benchmarks/matiec_harness/Cargo.lock') }}
+          restore-keys: harness-${{ runner.os }}-
+
+      # ── Run pipeline (builds harnesses, compiles, executes, validates) ──
+      - name: Run E2E benchmark pipeline
+        run: python benchmarks/run_e2e.py --cycles 1000 --warmup 100
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: results/
+          retention-days: 30
