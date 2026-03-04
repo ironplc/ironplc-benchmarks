@@ -14,7 +14,7 @@ on:
 env:
   # Pin compiler versions for reproducibility.
   LLVM_VER: "21"
-  RUSTY_REV: "main" # TODO: pin to a specific commit hash
+  RUSTY_REV: "master" # TODO: pin to a specific commit hash
   MATIEC_REV: "master" # TODO: pin to a specific commit hash
 
 jobs:
