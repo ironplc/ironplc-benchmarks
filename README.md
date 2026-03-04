@@ -15,8 +15,10 @@ benchmarks/
   rusty_harness/     # Rust binary that loads RuSTy-compiled .so files
     Cargo.toml
     src/main.rs
+  build_libs.sh      # Compiles all ST programs to .so at O0 and O2
   results/           # Generated at runtime (git-ignored)
-Dockerfile           # Dev container with Python 3, Rust, and LLVM 21
+out/                 # Compiled .so files (git-ignored)
+Dockerfile           # Dev container with Python 3, Rust, LLVM 21, and RuSTy
 PLAN.md              # Detailed benchmarking plan and paper outline
 ```
 
@@ -42,6 +44,30 @@ Install the following manually:
 - Python 3.12+
 - Rust 1.90+ (via [rustup](https://rustup.rs))
 - LLVM 21 (required to compile RuSTy)
+- RuSTy `plc` compiler (see [PLC-lang/rusty](https://github.com/PLC-lang/rusty))
+
+## Compiling ST programs to shared libraries
+
+The `build_libs.sh` script compiles all ST benchmark programs into shared libraries using the RuSTy compiler at two optimization levels (O0 and O2):
+
+```bash
+# Inside the Docker container (plc is pre-installed):
+./benchmarks/build_libs.sh
+
+# Or compile a single program:
+./benchmarks/build_libs.sh blinky.st
+```
+
+This produces files in `out/`:
+```
+out/blinky_O0.so       # Unoptimized (LLVM O0)
+out/blinky_O2.so       # Production-optimized (LLVM O2)
+out/arithmetic_O0.so
+out/arithmetic_O2.so
+...
+```
+
+The Docker image includes the RuSTy compiler pinned to a specific commit for reproducibility. To change the pinned version, update the `RUSTY_REV` build argument in the Dockerfile.
 
 ## Building the benchmark harness
 
@@ -72,15 +98,15 @@ Options:
 ### Example: compiling and benchmarking a program with RuSTy
 
 ```bash
-# Compile an ST program to a shared library with RuSTy
-plc benchmarks/programs/blinky.st --shared -o blinky.so
+# Compile all programs to shared libraries
+./benchmarks/build_libs.sh
 
 # Discover exported symbols
-nm -D blinky.so | grep ' T '
+nm -D out/blinky_O0.so | grep ' T '
 
 # Run the benchmark
 ./benchmarks/rusty_harness/target/release/rusty-harness \
-  --lib blinky.so \
+  --lib out/blinky_O0.so \
   --entry blinky \
   --init __init___blinky_st \
   --cycles 10000 \
@@ -122,9 +148,9 @@ The harness emits a JSON report to stdout:
 
 GitHub Actions runs on every push to `main` and `claude/**` branches, and on pull requests to `main`. The workflow includes three jobs:
 
-- **Build Docker image** — verifies the development container builds successfully
+- **Build Docker image** — builds the development container (including RuSTy) and compiles all ST programs to `.so` files
 - **Build benchmark harness** — compiles `rusty-harness` in release mode and runs `cargo clippy`
-- **Lint Python** — runs `ruff check` and `ruff format --check`
+- **Lint** — runs `ruff check`, `ruff format --check`, and `shellcheck`
 
 ## Linting
 
