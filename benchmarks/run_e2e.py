@@ -163,7 +163,7 @@ def compile_programs(st_files: list[Path], env: dict) -> dict[str, list[Path]]:
             if r.returncode == 0:
                 compiled[name].append(plc_file)
             else:
-                print(f"    FAIL: IronPLC compile")
+                print("    FAIL: IronPLC compile")
 
         print()
 
