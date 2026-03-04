@@ -11,6 +11,7 @@ Usage:
     python benchmarks/run_e2e.py --cycles 10000     # more cycles
     python benchmarks/run_e2e.py --programs blinky   # single program
 """
+
 from __future__ import annotations
 
 import argparse
@@ -114,8 +115,10 @@ def discover_environment() -> dict:
         print("ERROR: plc (RuSTy) is required but not found on PATH")
         sys.exit(1)
     if not env["rusty_harness"]:
-        print(f"ERROR: {RUSTY_HARNESS} not found — run: cargo build --release "
-              f"--manifest-path benchmarks/rusty_harness/Cargo.toml")
+        print(
+            f"ERROR: {RUSTY_HARNESS} not found — run: cargo build --release "
+            f"--manifest-path benchmarks/rusty_harness/Cargo.toml"
+        )
         sys.exit(1)
 
     return env
@@ -163,7 +166,7 @@ def compile_programs(st_files: list[Path], env: dict) -> dict[str, list[Path]]:
             if r.returncode == 0:
                 compiled[name].append(plc_file)
             else:
-                print(f"    FAIL: IronPLC compile")
+                print("    FAIL: IronPLC compile")
 
         print()
 
@@ -196,11 +199,22 @@ def run_benchmarks(
                         continue
                     out_json = result_dir / f"rusty_{opt}.json"
                     r = run(
-                        [str(RUSTY_HARNESS),
-                         "--lib", str(so), "--entry", entry, *init_args,
-                         "--cycles", str(cycles), "--warmup", str(warmup),
-                         "--opt-level", opt],
-                        capture_output=True, text=True,
+                        [
+                            str(RUSTY_HARNESS),
+                            "--lib",
+                            str(so),
+                            "--entry",
+                            entry,
+                            *init_args,
+                            "--cycles",
+                            str(cycles),
+                            "--warmup",
+                            str(warmup),
+                            "--opt-level",
+                            opt,
+                        ],
+                        capture_output=True,
+                        text=True,
                     )
                     if r.returncode == 0:
                         out_json.write_text(r.stdout)
@@ -216,11 +230,19 @@ def run_benchmarks(
                     continue
                 out_json = result_dir / f"matiec_{opt}.json"
                 r = run(
-                    [str(MATIEC_HARNESS),
-                     "--lib", str(so),
-                     "--cycles", str(cycles), "--warmup", str(warmup),
-                     "--opt-level", opt],
-                    capture_output=True, text=True,
+                    [
+                        str(MATIEC_HARNESS),
+                        "--lib",
+                        str(so),
+                        "--cycles",
+                        str(cycles),
+                        "--warmup",
+                        str(warmup),
+                        "--opt-level",
+                        opt,
+                    ],
+                    capture_output=True,
+                    text=True,
                 )
                 if r.returncode == 0:
                     out_json.write_text(r.stdout)
@@ -234,10 +256,19 @@ def run_benchmarks(
             if plc_file.exists():
                 out_json = result_dir / "ironplc.json"
                 r = run(
-                    ["ironplcc", "bench", str(plc_file),
-                     "--cycles", str(cycles), "--warmup", str(warmup),
-                     "--report-format", "json"],
-                    capture_output=True, text=True,
+                    [
+                        "ironplcc",
+                        "bench",
+                        str(plc_file),
+                        "--cycles",
+                        str(cycles),
+                        "--warmup",
+                        str(warmup),
+                        "--report-format",
+                        "json",
+                    ],
+                    capture_output=True,
+                    text=True,
                 )
                 if r.returncode == 0:
                     out_json.write_text(r.stdout)
@@ -332,9 +363,7 @@ def compare_results(result_files: list[Path]) -> bool:
             )
 
         # Overhead ratios vs RuSTy -O2
-        rusty_o2 = next(
-            (dur for label, dur in entries if label == "rusty_O2"), None
-        )
+        rusty_o2 = next((dur for label, dur in entries if label == "rusty_O2"), None)
         if rusty_o2 and rusty_o2["mean"] > 0:
             for label, dur in entries:
                 if label == "rusty_O2":
@@ -373,8 +402,7 @@ def compare_results(result_files: list[Path]) -> bool:
                     print(f"        {var}: {exp} vs {act}")
             else:
                 print(
-                    f"  PASS  {prog}: {ref_name} vs {other_name} "
-                    f"({len(ref_data)} vars)"
+                    f"  PASS  {prog}: {ref_name} vs {other_name} ({len(ref_data)} vars)"
                 )
 
     if not has_vars:
@@ -391,15 +419,20 @@ def main():
         description="End-to-end benchmark pipeline",
     )
     parser.add_argument(
-        "--cycles", type=int, default=DEFAULT_CYCLES,
+        "--cycles",
+        type=int,
+        default=DEFAULT_CYCLES,
         help=f"Measured scan cycles (default: {DEFAULT_CYCLES})",
     )
     parser.add_argument(
-        "--warmup", type=int, default=DEFAULT_WARMUP,
+        "--warmup",
+        type=int,
+        default=DEFAULT_WARMUP,
         help=f"Warmup cycles (default: {DEFAULT_WARMUP})",
     )
     parser.add_argument(
-        "--programs", nargs="*",
+        "--programs",
+        nargs="*",
         help="Program names to run (e.g. blinky arithmetic). Default: all.",
     )
     args = parser.parse_args()
@@ -407,9 +440,7 @@ def main():
     # Find ST files
     all_st = sorted(PROGRAMS_DIR.glob("*.st"))
     if args.programs:
-        st_files = [
-            f for f in all_st if f.stem in args.programs
-        ]
+        st_files = [f for f in all_st if f.stem in args.programs]
         if not st_files:
             print(f"No matching programs found for: {args.programs}")
             print(f"Available: {[f.stem for f in all_st]}")
