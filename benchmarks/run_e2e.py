@@ -47,21 +47,29 @@ def has_tool(name: str) -> bool:
     return shutil.which(name) is not None
 
 
-def discover_rusty_symbols(so_path: Path) -> tuple[str, str | None]:
-    """Find entry and init symbols in a RuSTy .so via nm."""
+def discover_rusty_symbols(so_path: Path) -> tuple[str, str | None, str | None]:
+    """Find entry, init, and instance symbols in a RuSTy .so via nm.
+
+    Returns (entry, init, instance) where entry is the program function,
+    init is the __init___<name>_st initializer, and instance is the
+    <name>_instance global that must be passed as the first argument.
+    """
     result = subprocess.run(
         ["nm", "-D", str(so_path)], capture_output=True, text=True, check=True
     )
-    entry, init = None, None
+    entry, init, instance = None, None, None
     for line in result.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 3 and parts[1] == "T":
+        if len(parts) == 3:
             sym = parts[2]
-            if "__init__" in sym:
-                init = sym
-            elif not sym.startswith("_"):
-                entry = entry or sym
-    return entry, init
+            if parts[1] == "T":
+                if "__init__" in sym:
+                    init = sym
+                elif not sym.startswith("_"):
+                    entry = entry or sym
+            elif parts[1] in ("B", "D") and sym.endswith("_instance"):
+                instance = sym
+    return entry, init, instance
 
 
 # ── Pipeline stages ─────────────────────────────────────────────────
@@ -134,13 +142,11 @@ def compile_programs(st_files: list[Path], env: dict) -> dict[str, list[Path]]:
         compiled[name] = []
         print(f"  Compile: {name}")
 
-        # RuSTy
+        # RuSTy — plc uses -O none / -O default (not -O0 / -O2)
+        OPT_FLAGS = {"O0": ["-O", "none"], "O2": ["-O", "default"]}
         for opt in ("O0", "O2"):
             so = OUT_DIR / f"{name}_{opt}.so"
-            cmd = ["plc", str(st), "--shared"]
-            if opt != "O0":
-                cmd += [f"-{opt}"]
-            cmd += ["-o", str(so)]
+            cmd = ["plc", str(st), "--shared", *OPT_FLAGS[opt], "-o", str(so)]
             r = run(cmd)
             if r.returncode == 0:
                 compiled[name].append(so)
@@ -188,9 +194,11 @@ def run_benchmarks(
         # RuSTy
         o0_so = OUT_DIR / f"{name}_O0.so"
         if o0_so.exists() and env["rusty_harness"]:
-            entry, init = discover_rusty_symbols(o0_so)
+            entry, init, instance = discover_rusty_symbols(o0_so)
             if not entry:
                 print(f"    SKIP: could not find entry symbol in {o0_so}")
+            elif not instance:
+                print(f"    SKIP: could not find instance symbol in {o0_so}")
             else:
                 init_args = ["--init", init] if init else []
                 for opt in ("O0", "O2"):
@@ -205,6 +213,8 @@ def run_benchmarks(
                             str(so),
                             "--entry",
                             entry,
+                            "--instance",
+                            instance,
                             *init_args,
                             "--cycles",
                             str(cycles),

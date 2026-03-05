@@ -11,6 +11,10 @@ use serde::Serialize;
 /// Loads a shared object produced by `plc --shared`, calls the program entry
 /// point for a configurable number of scan cycles, and emits a JSON timing
 /// report compatible with `ironplcc bench`.
+///
+/// RuSTy compiles each PROGRAM to a function that takes a pointer to an
+/// instance struct (e.g. `blinky(*mut blinky_instance)`). The harness looks
+/// up both the entry point and the instance symbol via dlsym.
 #[derive(Parser)]
 #[command(name = "rusty-harness")]
 struct Args {
@@ -21,6 +25,10 @@ struct Args {
     /// Symbol name of the program entry point (e.g. "blinky")
     #[arg(long)]
     entry: String,
+
+    /// Symbol name of the program instance global (e.g. "blinky_instance")
+    #[arg(long)]
+    instance: String,
 
     /// Symbol name of the initializer function (e.g. "__init___blinky_st")
     #[arg(long)]
@@ -76,10 +84,18 @@ fn main() -> Result<()> {
             .with_context(|| format!("Failed to load library: {}", args.lib.display()))?
     };
 
-    // Call the initializer if provided. RuSTy emits __init___<filename> (triple
-    // underscore, filename with dots replaced by underscores) which sets up
-    // global variables. On x86, constructors run automatically at dlopen, but
-    // we call it explicitly for cross-platform consistency.
+    // Look up the program instance global. RuSTy compiles each PROGRAM to a
+    // function that takes a pointer to its instance struct (containing all
+    // VAR declarations). The instance is a global symbol in the .so.
+    let instance_ptr: *mut u8 = unsafe {
+        let sym: Symbol<*mut u8> = lib
+            .get(args.instance.as_bytes())
+            .with_context(|| format!("Instance symbol not found: {}", args.instance))?;
+        *sym
+    };
+
+    // Call the initializer if provided. RuSTy emits __init___<filename>_st
+    // which internally finds the instance and initializes variables.
     if let Some(ref init_sym) = args.init {
         let init: Symbol<unsafe extern "C" fn()> = unsafe {
             lib.get(init_sym.as_bytes())
@@ -88,21 +104,22 @@ fn main() -> Result<()> {
         unsafe { init() };
     }
 
-    let entry: Symbol<unsafe extern "C" fn()> = unsafe {
+    // RuSTy entry points take a pointer to the instance struct.
+    let entry: Symbol<unsafe extern "C" fn(*mut u8)> = unsafe {
         lib.get(args.entry.as_bytes())
             .with_context(|| format!("Entry symbol not found: {}", args.entry))?
     };
 
     // Warmup — not measured; allows caches to stabilize
     for _ in 0..args.warmup {
-        unsafe { entry() };
+        unsafe { entry(instance_ptr) };
     }
 
     // Measured cycles — pre-allocate to avoid heap allocation during measurement
     let mut durations_ns: Vec<u64> = Vec::with_capacity(args.cycles);
     for _ in 0..args.cycles {
         let t0 = Instant::now();
-        unsafe { entry() };
+        unsafe { entry(instance_ptr) };
         durations_ns.push(t0.elapsed().as_nanos() as u64);
     }
 
