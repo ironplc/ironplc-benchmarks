@@ -156,10 +156,14 @@ pub fn run(args: &BenchArgs) -> anyhow::Result<()> {
         .load(&container, /* ...buffers... */)
         .start();
 
-    // Warmup — not measured, allows caches to stabilise
+    // Warmup — not measured, allows instruction/data caches and branch
+    // predictors to stabilise. Also warms up the timing infrastructure
+    // (first calls to clock_gettime can be slower due to vDSO setup).
     for i in 0..args.warmup {
+        let _t0 = Instant::now();  // warm the timer too
         vm.run_round(i as u64 * args.tick_us)
           .map_err(|e| anyhow::anyhow!("Trap during warmup: {:?}", e))?;
+        let _ = _t0.elapsed();
     }
 
     // Pre-allocate to avoid heap allocation during measurement
@@ -203,7 +207,13 @@ fn capture_variables(vm: &VmRunning, path: &Path) -> anyhow::Result<()> {
     let mut map = serde_json::Map::new();
     for i in 0..vm.num_variables() {
         if let Ok(v) = vm.read_variable(i) {
-            map.insert(format!("var_{i}"), serde_json::Value::Number(v.into()));
+            // Use the original ST variable name from the container's symbol table,
+            // not a positional index. This is critical for cross-compiler comparison:
+            // compare_outputs.py matches variables by name across RuSTy, MATIEC,
+            // and IronPLC output files.
+            let name = vm.variable_name(i)
+                .unwrap_or_else(|| format!("var_{i}"));
+            map.insert(name, serde_json::Value::Number(v.into()));
         }
     }
     std::fs::write(path, serde_json::to_string_pretty(&map)?)?;
@@ -294,9 +304,11 @@ fn main() -> anyhow::Result<()> {
         lib.get(args.entry.as_bytes())?
     };
 
-    // Warmup
+    // Warmup — stabilises caches and warms the timing infrastructure
     for _ in 0..args.warmup {
+        let _t0 = Instant::now();
         unsafe { entry() };
+        let _ = _t0.elapsed();
     }
 
     // Measured
@@ -477,9 +489,11 @@ fn main() -> anyhow::Result<()> {
         lib.get(args.entry.as_bytes())?
     };
 
-    // Warmup
+    // Warmup — stabilises caches and warms the timing infrastructure
     for _ in 0..args.warmup {
+        let _t0 = Instant::now();
         unsafe { entry() };
+        let _ = _t0.elapsed();
     }
 
     // Measured cycles
@@ -535,13 +549,13 @@ libc        = "0.2"
 
 ### 5.8 ST Source Compatibility Notes
 
-MATIEC's `iec2c` has some dialect differences from RuSTy:
+All benchmark programs must compile and run correctly on all three compilers (RuSTy, MATIEC, IronPLC). MATIEC's `iec2c` has some dialect differences from RuSTy that constrain the programs we can include:
 
-- **PROGRAM declarations:** MATIEC requires a `CONFIGURATION`/`RESOURCE`/`TASK` wrapper around the `PROGRAM` declaration. The benchmark programs may need a thin wrapper file or pragma to satisfy `iec2c`.
-- **Standard library coverage:** MATIEC implements the standard function blocks (TON, CTU, etc.) via C macro headers. Some RuSTy-specific extensions may not be supported.
-- **Pragma inclusion:** MATIEC supports `{#include "file.iecst"}` for modular code, which can be used to share the core program logic across compilers while providing compiler-specific wrappers.
+- **PROGRAM declarations:** MATIEC requires a `CONFIGURATION`/`RESOURCE`/`TASK` wrapper around the `PROGRAM` declaration. Each benchmark program includes this wrapper so that `iec2c` can parse it. RuSTy and IronPLC accept programs with or without the wrapper.
+- **Standard library coverage:** MATIEC implements the standard function blocks (TON, CTU, etc.) via C macro headers. Benchmark programs must only use function blocks supported by all three compilers.
+- **Pragma inclusion:** MATIEC supports `{#include "file.iecst"}` for modular code, which can be used to share the core program logic across compilers while providing compiler-specific wrappers if needed.
 
-If a benchmark program cannot compile on MATIEC due to dialect differences, it will be excluded from the MATIEC column of the results table with a note explaining the incompatibility. The minimum viable set for MATIEC is programs 1, 4, and 5 (blinky, arithmetic, for_loop), which use only basic ST features.
+Programs that cannot be made compatible with all three compilers are excluded from the benchmark suite at design time, not at runtime.
 
 ---
 
@@ -566,7 +580,7 @@ benchmarks/run_all.py
 Run the full benchmark pipeline for a single ST source file.
 
 Usage: python benchmarks/run_benchmark.py benchmarks/programs/blinky.st
-       python benchmarks/run_benchmark.py --skip-matiec benchmarks/programs/ton_oneshot.st
+       python benchmarks/run_benchmark.py benchmarks/programs/ton_oneshot.st
 """
 import argparse
 import json
@@ -605,8 +619,9 @@ def main():
     parser.add_argument("st_file", type=Path, help="Path to .st source file")
     parser.add_argument("--cycles", type=int, default=10_000)
     parser.add_argument("--warmup", type=int, default=1_000)
+    parser.add_argument("--runs", type=int, default=5,
+                        help="Number of independent runs per configuration")
     parser.add_argument("--tick-us", type=int, default=1_000)
-    parser.add_argument("--skip-matiec", action="store_true")
     args = parser.parse_args()
 
     name = args.st_file.stem
@@ -614,7 +629,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     Path("out").mkdir(exist_ok=True)
 
-    steps = 9 if not args.skip_matiec else 5
+    steps = 9
     step = 0
 
     def log(msg: str):
@@ -629,58 +644,71 @@ def main():
     log("RuSTy -O2 compile")
     run(["plc", str(args.st_file), "--shared", "-O2", "-o", f"out/{name}_O2.so"])
 
-    if not args.skip_matiec:
-        log("MATIEC -O0 compile")
-        run(["./benchmarks/matiec_compile.sh", str(args.st_file), "O0",
-             f"out/{name}_matiec_O0.so"])
+    log("MATIEC -O0 compile")
+    run(["./benchmarks/matiec_compile.sh", str(args.st_file), "O0",
+            f"out/{name}_matiec_O0.so"])
 
-        log("MATIEC -O2 compile")
-        run(["./benchmarks/matiec_compile.sh", str(args.st_file), "O2",
-             f"out/{name}_matiec_O2.so"])
+    log("MATIEC -O2 compile")
+    run(["./benchmarks/matiec_compile.sh", str(args.st_file), "O2",
+            f"out/{name}_matiec_O2.so"])
 
     log("IronPLC compile")
     run(["ironplcc", "compile", str(args.st_file), "-o", f"out/{name}.plc"])
 
-    # ── Run harnesses ────────────────────────────────────────
+    # ── Run harnesses (multiple independent runs) ──────────
     entry, init = discover_rusty_symbols(f"out/{name}_O0.so")
     init_args = ["--init", init] if init else []
 
     for opt in ("O0", "O2"):
-        log(f"RuSTy -{opt} run")
-        result = run(
-            ["./benchmarks/rusty_harness/target/release/rusty-harness",
-             "--lib", f"out/{name}_{opt}.so",
-             "--entry", entry, *init_args,
-             "--cycles", str(args.cycles), "--warmup", str(args.warmup),
-             "--opt-level", opt,
-             "--capture-output", str(out / f"rusty_{opt}_vars.json")],
-            capture_output=True, text=True,
-        )
-        (out / f"rusty_{opt}.json").write_text(result.stdout)
-
-    if not args.skip_matiec:
-        for opt in ("O0", "O2"):
-            log(f"MATIEC -{opt} run")
+        for r in range(args.runs):
+            log(f"RuSTy -{opt} run {r + 1}/{args.runs}")
+            # Capture output only on the last run (all runs produce the
+            # same final state; capturing once avoids I/O during timing).
+            capture_args = (
+                ["--capture-output", str(out / f"rusty_{opt}_vars.json")]
+                if r == args.runs - 1 else []
+            )
             result = run(
-                ["./benchmarks/matiec_harness/target/release/matiec-harness",
-                 "--lib", f"out/{name}_matiec_{opt}.so",
+                ["./benchmarks/rusty_harness/target/release/rusty-harness",
+                 "--lib", f"out/{name}_{opt}.so",
+                 "--entry", entry, *init_args,
                  "--cycles", str(args.cycles), "--warmup", str(args.warmup),
-                 "--opt-level", opt,
-                 "--capture-output", str(out / f"matiec_{opt}_vars.json")],
+                 "--opt-level", opt, *capture_args],
                 capture_output=True, text=True,
             )
-            (out / f"matiec_{opt}.json").write_text(result.stdout)
+            (out / f"rusty_{opt}_run{r}.json").write_text(result.stdout)
 
-    log("IronPLC run")
-    result = run(
-        ["ironplcc", "bench", f"out/{name}.plc",
-         "--cycles", str(args.cycles), "--warmup", str(args.warmup),
-         "--tick-us", str(args.tick_us),
-         "--capture-output", str(out / "ironplc_vars.json"),
-         "--report-format", "json"],
-        capture_output=True, text=True,
-    )
-    (out / "ironplc.json").write_text(result.stdout)
+    for opt in ("O0", "O2"):
+        for r in range(args.runs):
+            log(f"MATIEC -{opt} run {r + 1}/{args.runs}")
+            capture_args = (
+                ["--capture-output", str(out / f"matiec_{opt}_vars.json")]
+                if r == args.runs - 1 else []
+            )
+            result = run(
+                ["./benchmarks/matiec_harness/target/release/matiec-harness",
+                    "--lib", f"out/{name}_matiec_{opt}.so",
+                    "--cycles", str(args.cycles), "--warmup", str(args.warmup),
+                    "--opt-level", opt, *capture_args],
+                capture_output=True, text=True,
+            )
+            (out / f"matiec_{opt}_run{r}.json").write_text(result.stdout)
+
+    for r in range(args.runs):
+        log(f"IronPLC run {r + 1}/{args.runs}")
+        capture_args = (
+            ["--capture-output", str(out / "ironplc_vars.json")]
+            if r == args.runs - 1 else []
+        )
+        result = run(
+            ["ironplcc", "bench", f"out/{name}.plc",
+             "--cycles", str(args.cycles), "--warmup", str(args.warmup),
+             "--tick-us", str(args.tick_us),
+             *capture_args,
+             "--report-format", "json"],
+            capture_output=True, text=True,
+        )
+        (out / f"ironplc_run{r}.json").write_text(result.stdout)
 
     # ── Correctness check ────────────────────────────────────
     print(f"\n── Correctness: {name} ──")
@@ -696,11 +724,11 @@ def main():
         "--rusty-O2", str(out / "rusty_O2.json"),
         "--ironplc", str(out / "ironplc.json"),
     ]
-    if not args.skip_matiec:
-        report_args += [
-            "--matiec-O0", str(out / "matiec_O0.json"),
-            "--matiec-O2", str(out / "matiec_O2.json"),
-        ]
+
+    report_args += [
+        "--matiec-O0", str(out / "matiec_O0.json"),
+        "--matiec-O2", str(out / "matiec_O2.json"),
+    ]
     run(report_args)
 
     print(f"\nDone. Results in {out}/")
@@ -718,7 +746,7 @@ if __name__ == "__main__":
 Run benchmarks for all programs in the suite.
 
 Usage: python benchmarks/run_all.py
-       python benchmarks/run_all.py --skip-matiec
+       python benchmarks/run_all.py --cycles 100000
        python benchmarks/run_all.py --cycles 100000
 """
 import argparse
@@ -740,7 +768,8 @@ def main():
     parser = argparse.ArgumentParser(description="Run all benchmarks")
     parser.add_argument("--cycles", type=int, default=10_000)
     parser.add_argument("--warmup", type=int, default=1_000)
-    parser.add_argument("--skip-matiec", action="store_true")
+    parser.add_argument("--runs", type=int, default=5,
+                        help="Number of independent runs per configuration")
     args = parser.parse_args()
 
     failed = []
@@ -752,9 +781,8 @@ def main():
             sys.executable, "benchmarks/run_benchmark.py", prog,
             "--cycles", str(args.cycles),
             "--warmup", str(args.warmup),
+            "--runs", str(args.runs),
         ]
-        if args.skip_matiec:
-            cmd.append("--skip-matiec")
         result = subprocess.run(cmd)
         if result.returncode != 0:
             failed.append(prog)
@@ -797,13 +825,29 @@ Examples of deterministic final state:
 
 All three harnesses support a `--capture-output <PATH>` flag. After the measurement loop completes (timing window closed), the harness serializes the program's final variable values to JSON at the given path. This adds zero overhead to the measurement loop.
 
-**IronPLC:** `ironplcc bench --capture-output vars.json` serializes the VM's variable store after all cycles complete.
+**IronPLC:** `ironplcc bench --capture-output vars.json` serializes the VM's variable store after all cycles complete. Variable names come from the container's symbol table, which preserves the original ST identifiers.
 
 **RuSTy harness:** After the measurement loop, the harness reads global variable addresses from the `.so` via `dlsym` (using symbols discovered by `nm -D`) and writes them to JSON.
 
 **MATIEC harness:** After the measurement loop, the harness reads the program instance struct from the `.so` via `dlsym` (MATIEC generates predictable global symbols like `__CONFIG0__`) and writes variable values to JSON.
 
-The JSON format is the same across all three:
+### 7.3 Variable Name Normalization
+
+The three compilers use different symbol naming conventions for the same ST variables:
+
+- **RuSTy** exports global variables with lowercase names matching the ST source (e.g., `counter`, `output_coil`).
+- **MATIEC** wraps variables inside a configuration struct (`__CONFIG0__`) with mangled field names (e.g., `CONFIG0.RES0.INST0.COUNTER`).
+- **IronPLC** stores variables in a bytecode container with original ST names preserved in the symbol table.
+
+Each harness is responsible for **normalizing variable names to lowercase ST identifiers** before writing the JSON output file. The normalization rules:
+
+1. Strip any compiler-specific prefixes (e.g., `CONFIG0.RES0.INST0.` for MATIEC).
+2. Convert to lowercase (ST identifiers are case-insensitive per the standard).
+3. Use the ST `VAR` / `VAR_OUTPUT` identifier as the JSON key.
+
+This normalization is implemented in each harness rather than in `compare_outputs.py`, so that the JSON files are human-readable and directly comparable. Each benchmark program's expected variable names are documented in a `programs/EXPECTED.md` file that serves as the ground truth for what keys each harness must produce.
+
+The JSON format is the same across all three after normalization:
 
 ```json
 {
@@ -813,9 +857,9 @@ The JSON format is the same across all three:
 }
 ```
 
-### 7.3 `compare_outputs.py`
+### 7.4 `compare_outputs.py`
 
-Takes two or more variable JSON files and verifies they all agree. Compares every pair, reports any mismatches.
+Takes two or more variable JSON files and verifies they all agree. Compares every pair, reports any mismatches. Uses **exact comparison for integers and booleans** and **tolerance-based comparison for floating-point values** (relative tolerance 1e-9, absolute tolerance 1e-12) to account for differences in floating-point evaluation order across compilers.
 
 ```python
 #!/usr/bin/env python3
@@ -826,8 +870,25 @@ All input files must contain identical variable values.
 Usage: compare_outputs.py rusty_O2_vars.json matiec_O2_vars.json ironplc_vars.json
 """
 import json
+import math
 import sys
 from pathlib import Path
+
+# Floating-point comparison tolerances. These are deliberately tight —
+# all benchmark programs use integer arithmetic or simple FP operations
+# where compilers should agree to high precision. Loosen only if a
+# specific program justifies it.
+REL_TOL = 1e-9
+ABS_TOL = 1e-12
+
+
+def values_equal(expected, actual) -> bool:
+    """Compare two JSON values with tolerance for floats."""
+    if isinstance(expected, float) and isinstance(actual, (int, float)):
+        return math.isclose(expected, float(actual), rel_tol=REL_TOL, abs_tol=ABS_TOL)
+    if isinstance(actual, float) and isinstance(expected, (int, float)):
+        return math.isclose(float(expected), actual, rel_tol=REL_TOL, abs_tol=ABS_TOL)
+    return expected == actual
 
 
 def load(path: str) -> dict:
@@ -849,10 +910,19 @@ def main():
     for name in names[1:]:
         other = data[name]
         mismatches = []
+
+        # Check for variables present in reference but missing or different in other
         for var, expected in reference.items():
             actual = other.get(var)
-            if actual != expected:
+            if actual is None:
+                mismatches.append((var, expected, "<missing>"))
+            elif not values_equal(expected, actual):
                 mismatches.append((var, expected, actual))
+
+        # Check for variables present in other but missing in reference
+        for var in other:
+            if var not in reference:
+                mismatches.append((var, "<missing>", other[var]))
 
         if mismatches:
             all_pass = False
@@ -875,23 +945,28 @@ if __name__ == "__main__":
 
 ### 8.1 `report.py` — Per-Program Report
 
-Reads up to five JSON result files (RuSTy O0/O2, MATIEC O0/O2, IronPLC) and emits a formatted comparison table to stdout. MATIEC columns are optional — if `--matiec-O0` / `--matiec-O2` are not provided, those rows are omitted.
+Reads per-run JSON result files for each configuration, aggregates across runs (median of medians, min/max range), and emits a formatted comparison table to stdout with rows for all three compilers.
+
+For each configuration, `report.py` loads all `*_run{N}.json` files, extracts the p50 (median) from each run, then reports:
+- **median p50** across runs as the primary result
+- **min–max p50** across runs as the uncertainty range
+- **p99** from the run whose p50 is closest to the median (the "representative run")
 
 ```
 Program: blinky
-Cycles:  10,000  (warmup: 1,000)
+Cycles:  10,000  (warmup: 1,000, runs: 5)
 
-                  mean µs    p50 µs    p99 µs    max µs
-RuSTy  -O0           0.3       0.3       0.5       1.2
-RuSTy  -O2           0.1       0.1       0.2       0.4
-MATIEC -O0           0.4       0.3       0.6       1.5
-MATIEC -O2           0.2       0.2       0.3       0.6
-IronPLC              2.1       2.0       3.1       6.8
+                  median p50 µs   p50 range µs    p99 µs    max µs
+RuSTy  -O0              0.3       0.3 – 0.3        0.5       1.2
+RuSTy  -O2              0.1       0.1 – 0.1        0.2       0.4
+MATIEC -O0              0.3       0.3 – 0.4        0.6       1.5
+MATIEC -O2              0.2       0.2 – 0.2        0.3       0.6
+IronPLC                 2.0       1.9 – 2.1        3.1       6.8
 
-IronPLC overhead vs RuSTy  -O0:   7.0x  (mean)
-IronPLC overhead vs RuSTy  -O2:  21.0x  (mean)
-IronPLC overhead vs MATIEC -O0:   5.3x  (mean)
-IronPLC overhead vs MATIEC -O2:  10.5x  (mean)
+IronPLC overhead vs RuSTy  -O0:   6.7x  (median p50)
+IronPLC overhead vs RuSTy  -O2:  20.0x  (median p50)
+IronPLC overhead vs MATIEC -O0:   6.7x  (median p50)
+IronPLC overhead vs MATIEC -O2:  10.0x  (median p50)
 ```
 
 ### 8.2 `summary_table.py` — Cross-Program Table for Paper
@@ -901,14 +976,14 @@ Aggregates all per-program results into the table that goes directly into the pa
 ```
 Program          IronPLC p99    RuSTy -O2 p99    MATIEC -O2 p99    vs RuSTy    vs MATIEC    1 ms budget
 blinky                2.1 µs          0.2 µs           0.2 µs        10.5x        10.5x         ✓
-ton_oneshot           6.8 µs          0.4 µs              —          17.0x            —         ✓
+ton_oneshot           6.8 µs          0.4 µs           0.5 µs        17.0x        13.6x         ✓
 counter_up            5.1 µs          0.3 µs           0.3 µs        17.0x        17.0x         ✓
 arithmetic            4.3 µs          0.3 µs           0.3 µs        14.3x        14.3x         ✓
 for_loop             12.4 µs          0.7 µs           0.8 µs        17.7x        15.5x         ✓
 case_state            8.9 µs          0.5 µs           0.6 µs        17.8x        14.8x         ✓
 ```
 
-> **Note:** A dash (`—`) indicates the program could not be compiled by MATIEC due to dialect incompatibility.
+> **Note:** All programs in the suite must compile and produce correct results on all three compilers.
 
 ---
 
@@ -1028,8 +1103,8 @@ python benchmarks/run_benchmark.py benchmarks/programs/blinky.st
 - Results in `benchmarks/reference_results/` were collected on `<CPU>`, `<OS>`, kernel `<version>`.
 - Absolute timings vary by hardware. The overhead ratios (IronPLC p99 / RuSTy O2 p99, IronPLC p99 / MATIEC O2 p99) are expected to be stable across x86-64 platforms.
 - RuSTy was pinned to commit `<hash>`. MATIEC was pinned to commit `<hash>`. IronPLC was built from commit `<hash>`.
-- For lower variance, increase cycles: `python benchmarks/run_all.py --cycles 100000`
-- To skip MATIEC (e.g. if `iec2c` is not installed): `python benchmarks/run_all.py --skip-matiec`
+- For lower variance, increase cycles or runs: `python benchmarks/run_all.py --cycles 100000 --runs 10`
+- All three compilers (`plc`, `iec2c`, `ironplcc`) must be installed to run the full suite.
 
 ---
 
@@ -1057,18 +1132,17 @@ The script handles **everything** after toolchain installation — including bui
 4. **Validate** — verify every JSON result has required keys (`program`, `opt_level`, `cycles`, `warmup`, `durations_us.{mean,p50,p99,min,max}`) and sane values
 5. **Compare** — print side-by-side timing table; compare final variable state across compilers (when capture files exist)
 
-### 11.2 Graceful Degradation
+### 11.2 Required Components
 
-The script works incrementally. If only `plc` + `rusty-harness` are available, it runs just the RuSTy pipeline. As MATIEC and IronPLC components are added, they automatically participate:
+The script verifies all toolchains are available before starting. If any component is missing, the script exits with an error message indicating what to install.
 
-| Component | Detection | Behavior when missing |
+| Component | Detection | Required? |
 |---|---|---|
-| `plc` (RuSTy) | `which plc` | **Required** — script exits |
-| `rusty-harness` | binary exists (auto-built if `Cargo.toml` present) | **Required** — script exits |
-| `iec2c` + `matiec_compile.sh` | `which iec2c` + file exists | Skips MATIEC compilation |
-| `matiec-harness` | binary exists | Skips MATIEC execution |
-| `ironplcc` | `which ironplcc` | Skips IronPLC compilation + execution |
-| `--capture-output` | `*_vars.json` files exist | Skips final-state comparison |
+| `plc` (RuSTy) | `which plc` | **Yes** — script exits |
+| `rusty-harness` | binary exists (auto-built if `Cargo.toml` present) | **Yes** — script exits |
+| `iec2c` + `matiec_compile.sh` | `which iec2c` + file exists | **Yes** — script exits |
+| `matiec-harness` | binary exists (auto-built if `Cargo.toml` present) | **Yes** — script exits |
+| `ironplcc` | `which ironplcc` | **Yes** — script exits |
 
 ### 11.3 GitHub Actions Workflow
 
@@ -1133,7 +1207,9 @@ Programs 1–4 form the minimum set required to validate the VM's arithmetic and
 
 **Toolchains.** IronPLC compiles ST source to bytecode via `ironplcc compile` and executes via the `ironplcc bench` subcommand. RuSTy compiles the same ST source to a native shared library via `plc --shared`, which is then executed by a thin Rust harness that calls the program entry point in a loop. MATIEC transpiles the same ST source to ANSI C via `iec2c`, which is then compiled to a shared library by GCC and executed by an equivalent Rust harness. Both RuSTy and MATIEC are evaluated at two optimization levels: `-O0` (unoptimized, a fairer baseline that isolates the interpreter-vs-dispatch distinction from backend optimization) and `-O2` (production-grade, the realistic ceiling for native execution).
 
-**Measurement protocol.** Each program runs for 1,000 warmup cycles (unmeasured) followed by 10,000 measured cycles. Warmup stabilises instruction and data caches. All processes are pinned to a single CPU core via `sched_setaffinity`. Timing uses `CLOCK_MONOTONIC_RAW` on Linux, which is unaffected by NTP adjustments. We report mean, p50, p99, and max cycle time. **p99 is the primary metric** because it governs worst-case latency, which determines real-time deployability.
+**Measurement protocol.** Each program runs for 1,000 warmup cycles (unmeasured) followed by 10,000 measured cycles. Warmup stabilises instruction caches, data caches, branch predictors, and the timing infrastructure itself (each warmup cycle includes a no-op timer call to ensure the vDSO path is hot). Each benchmark configuration is executed for **5 independent runs**; we report the **median of run medians** as the primary result and the **min/max across runs** as the uncertainty range. This guards against transient system noise affecting a single run. All processes are pinned to a single CPU core via `sched_setaffinity`. We report mean, p50, p99, and max cycle time per run. **p99 is the primary metric** because it governs worst-case latency, which determines real-time deployability.
+
+**Timer resolution.** All harnesses use Rust's `std::time::Instant`, which maps to `clock_gettime(CLOCK_MONOTONIC)` on Linux. On modern x86-64, this has nanosecond resolution via the vDSO, with a call overhead of approximately 20–25 ns. For the fastest native-code benchmarks (RuSTy O2, expected ~100–200 ns per cycle), the timer overhead is 10–25% of the measured value. We mitigate this by: (a) reporting the overhead ratio IronPLC/native rather than absolute native times, since both measurements include the same timer overhead, and (b) including an empty-body calibration benchmark that measures the timer overhead in isolation, which is subtracted in the detailed analysis. If absolute sub-100 ns measurements are needed, an alternative approach using `rdtsc` with a calibrated frequency can be employed.
 
 **Equivalence of measurement.** The IronPLC `bench` subcommand places `Instant::now()` calls outside `run_round`, so the VM executes identically to production. The RuSTy and MATIEC harnesses place equivalent timing calls outside the entry point call. All three harnesses use the same JSON report format; the summary table is generated by a single Python script consuming all results.
 
@@ -1145,24 +1221,22 @@ Programs 1–4 form the minimum set required to validate the VM's arithmetic and
 
 #### 5.4 Correctness Results
 
-All N programs in the benchmark suite produce identical output values when executed by IronPLC, RuSTy, and MATIEC for 10,000 scan cycles. This confirms that IronPLC's bytecode semantics match the IEC 61131-3 specification for the language features exercised by the suite. _(If any programs required debugging to reach this result, describe the defect and fix in one sentence each. If any programs could not be compiled by MATIEC due to dialect differences, note which programs and why.)_
+All N programs in the benchmark suite produce identical output values when executed by IronPLC, RuSTy, and MATIEC for 10,000 scan cycles. This confirms that IronPLC's bytecode semantics match the IEC 61131-3 specification for the language features exercised by the suite. _(If any programs required debugging to reach this result, describe the defect and fix in one sentence each.)_
 
 ---
 
 #### 5.5 Performance Results
 
-_Table 2: Per-cycle execution time (µs), 10,000 cycles._
+_Table 2: Per-cycle execution time (µs), 10,000 cycles × 5 runs. Values are median p50 across runs; parenthesized range shows min–max p50._
 
 |Program|RuSTy -O2 p99|MATIEC -O2 p99|IronPLC p99|vs RuSTy|vs MATIEC|1 ms budget|
 |---|---|---|---|---|---|---|
 |Blinky||||||✓|
-|TON one-shot||||| — |✓|
+|TON one-shot||||||✓|
 |Counter||||||✓|
 |Arithmetic||||||✓|
 |FOR loop||||||✓|
 |CASE state||||||✓|
-
-> A dash (`—`) indicates the program could not be compiled by MATIEC due to dialect incompatibility.
 
 IronPLC's interpreted execution is Nx–Mx slower than RuSTy's LLVM-optimized native code and Ax–Bx slower than MATIEC's GCC-compiled C code (Table 2). This overhead is consistent with published comparisons between bytecode interpreters and native code in other domains. Despite this overhead, IronPLC's p99 cycle time remains below Y µs across all benchmark programs — well within the 1 ms cycle budget common in industrial PLC applications.
 
@@ -1183,7 +1257,8 @@ The comparison between RuSTy and MATIEC is also informative: RuSTy's LLVM backen
 1. The benchmark programs are small; real PLC programs may be larger and exhibit different instruction cache behaviour.
 2. Measurements were taken on a general-purpose OS without real-time scheduling. Production deployments on PREEMPT_RT or dedicated hardware would see different absolute timings and lower variance.
 3. RuSTy, MATIEC, and IronPLC do not share a compiler front-end; the same ST source was compiled independently by each toolchain. Programs were manually verified to be semantically equivalent by comparing output traces.
-4. MATIEC may not compile all benchmark programs due to dialect differences with RuSTy's ST extensions. Programs that MATIEC cannot compile are excluded from its column in the results table.
+4. All benchmark programs were written to the intersection of ST features supported by RuSTy, MATIEC, and IronPLC. Programs requiring compiler-specific extensions (e.g., RuSTy-only features not supported by MATIEC's `iec2c`) were excluded from the suite at design time.
+5. Timer overhead (`clock_gettime` call cost of ~20–25 ns) is non-negligible relative to the fastest native-code cycle times (~100–200 ns). Since all harnesses use the same timer, the overhead cancels in ratio comparisons but inflates absolute native-code times. We report an empty-body calibration measurement to quantify this effect.
 
 ---
 
