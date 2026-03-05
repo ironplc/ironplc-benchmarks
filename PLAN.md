@@ -67,8 +67,15 @@ Each program is designed so that its final variable state after N cycles is **de
 |6|`case_state.st`|OpenPLC examples|CASE statement, state machine|`state` determined by `11000 mod 4`|
 |7|`nested_fb.st`|RuSTy test suite|FB calling FB, multiple instances|Deterministic FB instance state|
 |8|`array_sort.st`|Custom|Array indexing, bubble sort|Sorted array, deterministic final values|
+|9|`noop.st`|Custom|Empty program body; timer calibration|All variables unchanged|
+|10|`large_fb.st`|Custom|10+ nested FB instances, 50+ variables|Deterministic multi-instance state|
+|11|`array_large.st`|Custom|Bubble sort on 1000-element array|Sorted array, deterministic final values|
 
 > **Note:** "11,000 cycles" = 1,000 warmup + 10,000 measured (default). The expected final state column shows what all compilers must agree on to pass the correctness check.
+>
+> Program 9 (`noop.st`) is a **timer calibration benchmark** — an empty program body whose measured cycle time quantifies the per-call overhead of the timing infrastructure and harness dispatch. This baseline is reported alongside all other results and subtracted in the detailed analysis of absolute native-code times.
+>
+> Programs 10–11 are **scaled variants** that deliberately increase program size to test whether the overhead ratio (IronPLC / native) is stable as programs grow beyond L1 instruction cache. `large_fb.st` stresses the call stack and variable scoping with many FB instances; `array_large.st` stresses memory access patterns with a large working set.
 
 ### 2.2 Selection Rationale
 
@@ -78,6 +85,9 @@ Each program is designed so that its final variable state after N cycles is **de
 - **FOR loop and CASE** exercise control flow opcodes (JMP, JMP_IF, JMP_UNLESS) which are the next major opcodes to implement after arithmetic.
 - **Nested FB** tests the call stack and variable scoping, which are architecturally significant for the VM.
 - **Array sort** is memory-access-heavy and exercises the indexing opcodes.
+- **Noop** is the timer calibration baseline — measures pure harness + timer overhead with zero program logic.
+- **Large FB** scales nested FB to 10+ instances and 50+ variables, testing whether overhead ratios hold as programs outgrow L1 icache.
+- **Array large** scales array sort to 1000 elements, creating a working set that stresses data cache behavior.
 
 ### 2.3 Minimum Viable Benchmark Set
 
@@ -112,8 +122,12 @@ Options:
   --warmup <N>            Unmeasured warmup cycles [default: 1000]
   --tick-us <N>           Simulated clock tick per cycle in microseconds [default: 1000]
   --capture-output <PATH> Write final variable state as JSON to PATH
+  --trace-every <N>       Capture variable state every N cycles to a JSONL trace file [default: 0 = off]
   --report-format <FMT>   Output format: text (default) | json
   --pin-cpu               Pin to CPU 0 using sched_setaffinity (Linux only)
+  --rt-priority           Set SCHED_FIFO real-time priority (Linux, requires CAP_SYS_NICE)
+  --batch-timing          Additionally report total wall time for all measured cycles as a single
+                          Instant::now() pair (no per-cycle timer overhead)
 ```
 
 ### 3.4 Implementation
@@ -127,8 +141,11 @@ pub struct BenchArgs {
     pub warmup: usize,
     pub tick_us: u64,
     pub capture_output: Option<PathBuf>,
+    pub trace_every: usize,
     pub report_format: ReportFormat,
     pub pin_cpu: bool,
+    pub rt_priority: bool,
+    pub batch_timing: bool,
 }
 
 pub struct BenchReport {
@@ -140,12 +157,19 @@ pub struct BenchReport {
     pub p99_us: f64,
     pub max_us: f64,
     pub min_us: f64,
+    pub cv: f64,             // coefficient of variation (stddev / mean)
+    pub batch_mean_us: Option<f64>,  // mean from batch timing (if --batch-timing)
 }
 
 pub fn run(args: &BenchArgs) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     if args.pin_cpu {
         pin_to_cpu(0)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if args.rt_priority {
+        set_sched_fifo()?;
     }
 
     let bytes = std::fs::read(&args.file)?;
@@ -155,6 +179,14 @@ pub fn run(args: &BenchArgs) -> anyhow::Result<()> {
     let mut vm = Vm::new()
         .load(&container, /* ...buffers... */)
         .start();
+
+    // Open trace file if requested (outside measurement loop)
+    let mut trace_file = if args.trace_every > 0 {
+        let path = args.file.with_extension("trace.jsonl");
+        Some(std::io::BufWriter::new(std::fs::File::create(&path)?))
+    } else {
+        None
+    };
 
     // Warmup — not measured, allows instruction/data caches and branch
     // predictors to stabilise. Also warms up the timing infrastructure
@@ -169,38 +201,99 @@ pub fn run(args: &BenchArgs) -> anyhow::Result<()> {
     // Pre-allocate to avoid heap allocation during measurement
     let mut durations_ns: Vec<u64> = Vec::with_capacity(args.cycles);
 
+    // Batch timing: single Instant pair around entire loop (no per-cycle overhead)
+    let batch_t0 = Instant::now();
+
     for i in 0..args.cycles {
         let t = (args.warmup + i) as u64 * args.tick_us;
         let t0 = Instant::now();
         vm.run_round(t)
           .map_err(|e| anyhow::anyhow!("Trap at cycle {i}: {:?}", e))?;
         durations_ns.push(t0.elapsed().as_nanos() as u64);
+
+        // Trace capture (outside timing window — the Instant pair above
+        // already recorded the duration before we reach this point)
+        if args.trace_every > 0 && (i + 1) % args.trace_every == 0 {
+            if let Some(ref mut f) = trace_file {
+                write_trace_line(f, &vm, args.warmup + i)?;
+            }
+        }
     }
+
+    let batch_elapsed_ns = batch_t0.elapsed().as_nanos() as u64;
 
     // Variable capture — after measurement loop, no overhead impact
     if let Some(ref path) = args.capture_output {
         capture_variables(&vm, path)?;
     }
 
-    let report = compute_report(args, &mut durations_ns);
+    let report = compute_report(args, &mut durations_ns, batch_elapsed_ns);
     emit_report(&report, &args.report_format);
     Ok(())
 }
 
-fn compute_report(args: &BenchArgs, durations_ns: &mut Vec<u64>) -> BenchReport {
+fn compute_report(
+    args: &BenchArgs,
+    durations_ns: &mut Vec<u64>,
+    batch_elapsed_ns: u64,
+) -> BenchReport {
     durations_ns.sort_unstable();
     let n = durations_ns.len();
     let sum: u64 = durations_ns.iter().sum();
+    let mean = sum as f64 / n as f64;
+    let variance = durations_ns.iter()
+        .map(|&d| { let diff = d as f64 - mean; diff * diff })
+        .sum::<f64>() / n as f64;
+    let stddev = variance.sqrt();
+
     BenchReport {
         program: args.file.display().to_string(),
         cycles: args.cycles,
         warmup: args.warmup,
-        mean_us: (sum as f64 / n as f64) / 1_000.0,
+        mean_us: mean / 1_000.0,
         p50_us:  durations_ns[n * 50 / 100] as f64 / 1_000.0,
         p99_us:  durations_ns[n * 99 / 100] as f64 / 1_000.0,
         max_us:  durations_ns[n - 1] as f64 / 1_000.0,
         min_us:  durations_ns[0] as f64 / 1_000.0,
+        cv: if mean > 0.0 { stddev / mean } else { 0.0 },
+        batch_mean_us: if args.batch_timing {
+            Some((batch_elapsed_ns as f64 / n as f64) / 1_000.0)
+        } else {
+            None
+        },
     }
+}
+
+#[cfg(target_os = "linux")]
+fn set_sched_fifo() -> anyhow::Result<()> {
+    use libc::{sched_param, sched_setscheduler, SCHED_FIFO};
+    let param = sched_param { sched_priority: 1 };
+    let ret = unsafe { sched_setscheduler(0, SCHED_FIFO, &param) };
+    if ret != 0 {
+        anyhow::bail!(
+            "sched_setscheduler(SCHED_FIFO) failed (errno {}). \
+             Run with CAP_SYS_NICE or as root.",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+fn write_trace_line(
+    f: &mut impl std::io::Write,
+    vm: &VmRunning,
+    cycle: usize,
+) -> anyhow::Result<()> {
+    let mut map = serde_json::Map::new();
+    map.insert("cycle".into(), serde_json::Value::Number(cycle.into()));
+    for i in 0..vm.num_variables() {
+        if let Ok(v) = vm.read_variable(i) {
+            let name = vm.variable_name(i).unwrap_or_else(|| format!("var_{i}"));
+            map.insert(name, serde_json::Value::Number(v.into()));
+        }
+    }
+    writeln!(f, "{}", serde_json::Value::Object(map))?;
+    Ok(())
 }
 
 fn capture_variables(vm: &VmRunning, path: &Path) -> anyhow::Result<()> {
@@ -234,9 +327,13 @@ fn capture_variables(vm: &VmRunning, path: &Path) -> anyhow::Result<()> {
     "p99":  6.8,
     "min":  3.9,
     "max": 12.3
-  }
+  },
+  "cv": 0.032,
+  "batch_mean_us": 4.0
 }
 ```
+
+> `cv` is the coefficient of variation (stddev / mean) across per-cycle measurements. Values below 0.05 indicate low scheduling noise; values above 0.10 suggest the environment is too noisy for reliable results. `batch_mean_us` is present only when `--batch-timing` is used and provides the mean cycle time derived from a single `Instant::now()` pair around the entire measurement loop, eliminating per-cycle timer overhead.
 
 ### 3.6 What This Does NOT Touch
 
@@ -289,10 +386,24 @@ struct Args {
     #[arg(long, default_value = "1000")]  warmup: usize,
     #[arg(long)] capture_output: Option<PathBuf>,
     #[arg(long)] opt_level: String,   // "O0" or "O2" — metadata only
+    #[arg(long)] pin_cpu: bool,
+    #[arg(long)] rt_priority: bool,
+    #[arg(long)] batch_timing: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    #[cfg(target_os = "linux")]
+    if args.pin_cpu {
+        pin_to_cpu(0)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if args.rt_priority {
+        set_sched_fifo()?;
+    }
+
     let lib = unsafe { Library::new(&args.lib)? };
 
     if let Some(ref sym) = args.init {
@@ -313,13 +424,15 @@ fn main() -> anyhow::Result<()> {
 
     // Measured
     let mut durations_ns: Vec<u64> = Vec::with_capacity(args.cycles);
+    let batch_t0 = Instant::now();
     for _ in 0..args.cycles {
         let t0 = Instant::now();
         unsafe { entry() };
         durations_ns.push(t0.elapsed().as_nanos() as u64);
     }
+    let batch_elapsed_ns = batch_t0.elapsed().as_nanos() as u64;
 
-    emit_report(&args, &mut durations_ns);
+    emit_report(&args, &mut durations_ns, batch_elapsed_ns);
     Ok(())
 }
 ```
@@ -333,6 +446,7 @@ libloading = "0.8"
 clap       = { version = "4", features = ["derive"] }
 serde_json = "1"
 anyhow     = "1"
+libc       = "0.2"
 ```
 
 ### 4.6 Compiling RuSTy Shared Libraries
@@ -466,6 +580,14 @@ struct Args {
     /// Pin process to CPU 0 (Linux only)
     #[arg(long)]
     pin_cpu: bool,
+
+    /// Set SCHED_FIFO real-time priority (Linux, requires CAP_SYS_NICE)
+    #[arg(long)]
+    rt_priority: bool,
+
+    /// Additionally report batch mean (single timer pair around entire loop)
+    #[arg(long)]
+    batch_timing: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -474,6 +596,11 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     if args.pin_cpu {
         pin_to_cpu(0)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if args.rt_priority {
+        set_sched_fifo()?;
     }
 
     let lib = unsafe { Library::new(&args.lib)? };
@@ -498,13 +625,15 @@ fn main() -> anyhow::Result<()> {
 
     // Measured cycles
     let mut durations_ns: Vec<u64> = Vec::with_capacity(args.cycles);
+    let batch_t0 = Instant::now();
     for _ in 0..args.cycles {
         let t0 = Instant::now();
         unsafe { entry() };
         durations_ns.push(t0.elapsed().as_nanos() as u64);
     }
+    let batch_elapsed_ns = batch_t0.elapsed().as_nanos() as u64;
 
-    emit_report(&args, &mut durations_ns);
+    emit_report(&args, &mut durations_ns, batch_elapsed_ns);
     Ok(())
 }
 ```
@@ -622,6 +751,12 @@ def main():
     parser.add_argument("--runs", type=int, default=5,
                         help="Number of independent runs per configuration")
     parser.add_argument("--tick-us", type=int, default=1_000)
+    parser.add_argument("--rt-priority", action="store_true",
+                        help="Set SCHED_FIFO real-time priority (requires CAP_SYS_NICE)")
+    parser.add_argument("--batch-timing", action="store_true",
+                        help="Additionally report batch mean (single timer pair)")
+    parser.add_argument("--trace-every", type=int, default=0,
+                        help="Capture variable state every N cycles (0 = off)")
     args = parser.parse_args()
 
     name = args.st_file.stem
@@ -655,10 +790,16 @@ def main():
     log("IronPLC compile")
     run(["ironplcc", "compile", str(args.st_file), "-o", f"out/{name}.plc"])
 
-    # ── Run harnesses (multiple independent runs) ──────────
+    # ── Common harness flags ────────────────────────────────
     entry, init = discover_rusty_symbols(f"out/{name}_O0.so")
     init_args = ["--init", init] if init else []
+    common_flags: list[str] = []
+    if args.rt_priority:
+        common_flags.append("--rt-priority")
+    if args.batch_timing:
+        common_flags.append("--batch-timing")
 
+    # ── Run harnesses (multiple independent runs) ──────────
     for opt in ("O0", "O2"):
         for r in range(args.runs):
             log(f"RuSTy -{opt} run {r + 1}/{args.runs}")
@@ -673,7 +814,8 @@ def main():
                  "--lib", f"out/{name}_{opt}.so",
                  "--entry", entry, *init_args,
                  "--cycles", str(args.cycles), "--warmup", str(args.warmup),
-                 "--opt-level", opt, *capture_args],
+                 "--opt-level", opt, "--pin-cpu",
+                 *common_flags, *capture_args],
                 capture_output=True, text=True,
             )
             (out / f"rusty_{opt}_run{r}.json").write_text(result.stdout)
@@ -689,11 +831,16 @@ def main():
                 ["./benchmarks/matiec_harness/target/release/matiec-harness",
                     "--lib", f"out/{name}_matiec_{opt}.so",
                     "--cycles", str(args.cycles), "--warmup", str(args.warmup),
-                    "--opt-level", opt, *capture_args],
+                    "--opt-level", opt, "--pin-cpu",
+                    *common_flags, *capture_args],
                 capture_output=True, text=True,
             )
             (out / f"matiec_{opt}_run{r}.json").write_text(result.stdout)
 
+    trace_args = (
+        ["--trace-every", str(args.trace_every)]
+        if args.trace_every > 0 else []
+    )
     for r in range(args.runs):
         log(f"IronPLC run {r + 1}/{args.runs}")
         capture_args = (
@@ -703,8 +850,8 @@ def main():
         result = run(
             ["ironplcc", "bench", f"out/{name}.plc",
              "--cycles", str(args.cycles), "--warmup", str(args.warmup),
-             "--tick-us", str(args.tick_us),
-             *capture_args,
+             "--tick-us", str(args.tick_us), "--pin-cpu",
+             *common_flags, *trace_args, *capture_args,
              "--report-format", "json"],
             capture_output=True, text=True,
         )
@@ -755,12 +902,17 @@ import sys
 from pathlib import Path
 
 PROGRAMS = [
+    "benchmarks/programs/noop.st",
     "benchmarks/programs/blinky.st",
     "benchmarks/programs/ton_oneshot.st",
     "benchmarks/programs/counter_up.st",
     "benchmarks/programs/arithmetic.st",
     "benchmarks/programs/for_loop.st",
     "benchmarks/programs/case_state.st",
+    "benchmarks/programs/nested_fb.st",
+    "benchmarks/programs/array_sort.st",
+    "benchmarks/programs/large_fb.st",
+    "benchmarks/programs/array_large.st",
 ]
 
 
@@ -770,6 +922,12 @@ def main():
     parser.add_argument("--warmup", type=int, default=1_000)
     parser.add_argument("--runs", type=int, default=5,
                         help="Number of independent runs per configuration")
+    parser.add_argument("--rt-priority", action="store_true",
+                        help="Set SCHED_FIFO real-time priority")
+    parser.add_argument("--batch-timing", action="store_true",
+                        help="Additionally report batch mean")
+    parser.add_argument("--trace-every", type=int, default=0,
+                        help="Capture variable state every N cycles (0 = off)")
     args = parser.parse_args()
 
     failed = []
@@ -783,6 +941,12 @@ def main():
             "--warmup", str(args.warmup),
             "--runs", str(args.runs),
         ]
+        if args.rt_priority:
+            cmd.append("--rt-priority")
+        if args.batch_timing:
+            cmd.append("--batch-timing")
+        if args.trace_every > 0:
+            cmd += ["--trace-every", str(args.trace_every)]
         result = subprocess.run(cmd)
         if result.returncode != 0:
             failed.append(prog)
@@ -790,6 +954,11 @@ def main():
     # Summary table across all programs
     subprocess.run([
         sys.executable, "benchmarks/tools/summary_table.py", "results/"
+    ])
+
+    # Program size table (bytecode / .text section sizes)
+    subprocess.run([
+        sys.executable, "benchmarks/tools/program_sizes.py", "out/"
     ])
 
     if failed:
@@ -992,6 +1161,7 @@ case_state            8.9 µs          0.5 µs           0.6 µs        17.8x   
 ```
 benchmarks/
   programs/                    # ST source files (vendored at pinned commits)
+    noop.st                    # Timer calibration (empty body)
     blinky.st
     ton_oneshot.st
     counter_up.st
@@ -1000,7 +1170,10 @@ benchmarks/
     case_state.st
     nested_fb.st
     array_sort.st
+    large_fb.st                # Scaled: 10+ FB instances, 50+ variables
+    array_large.st             # Scaled: bubble sort on 1000-element array
     SOURCES.md                 # Provenance, license, upstream commit hash per file
+    EXPECTED.md                # Expected variable names per program (ground truth for comparison)
   rusty_harness/               # Component 2
     Cargo.toml
     src/main.rs
@@ -1010,8 +1183,10 @@ benchmarks/
   matiec_compile.sh            # ST → C → .so compilation wrapper
   tools/                       # Components 5 & 6
     compare_outputs.py
+    compare_traces.py          # Cycle-by-cycle JSONL trace comparison
     report.py
     summary_table.py
+    program_sizes.py           # Report bytecode / .text section sizes (Table 3)
   run_benchmark.py             # Component 4 — single program
   run_all.py                   # Component 4 — full suite
   run_e2e.py                   # E2E pipeline (CI and local)
@@ -1020,11 +1195,18 @@ benchmarks/
     .gitkeep
   reference_results/           # Checked in — the paper's actual numbers
     blinky/
-      rusty_O0.json
-      rusty_O2.json
-      matiec_O0.json
-      matiec_O2.json
-      ironplc.json
+      rusty_O0_run0.json       # Per-run results (5 runs per configuration)
+      rusty_O0_run1.json
+      ...
+      rusty_O2_run0.json
+      ...
+      matiec_O0_run0.json
+      ...
+      ironplc_run0.json
+      ...
+      rusty_O2_vars.json       # Final variable state
+      matiec_O2_vars.json
+      ironplc_vars.json
     ...                        # One directory per benchmark program
 
 .github/
@@ -1098,13 +1280,31 @@ python benchmarks/run_all.py
 python benchmarks/run_benchmark.py benchmarks/programs/blinky.st
 ```
 
+### System Preparation (Paper Runs)
+
+For paper-quality results, prepare the system to minimize measurement noise:
+
+```bash
+# Set CPU governor to fixed frequency (requires root)
+sudo cpupower frequency-set -g performance
+
+# Verify governor is set
+cpupower frequency-info | grep "current policy"
+
+# Run the full suite with RT priority, CPU pinning, and batch timing
+# (requires CAP_SYS_NICE or root for SCHED_FIFO)
+sudo python benchmarks/run_all.py --rt-priority --batch-timing --runs 5
+```
+
 ### Reproducibility Notes
 
-- Results in `benchmarks/reference_results/` were collected on `<CPU>`, `<OS>`, kernel `<version>`.
-- Absolute timings vary by hardware. The overhead ratios (IronPLC p99 / RuSTy O2 p99, IronPLC p99 / MATIEC O2 p99) are expected to be stable across x86-64 platforms.
+- Results in `benchmarks/reference_results/` were collected on `<CPU>`, `<OS>`, kernel `<version>`, CPU governor `performance`.
+- Cross-platform results were collected on `<ARM64 platform>`, `<OS>`, kernel `<version>`.
+- Absolute timings vary by hardware. The overhead ratios (IronPLC p99 / RuSTy O2 p99, IronPLC p99 / MATIEC O2 p99) are expected to be stable across platforms (see Section 5.7).
 - RuSTy was pinned to commit `<hash>`. MATIEC was pinned to commit `<hash>`. IronPLC was built from commit `<hash>`.
 - For lower variance, increase cycles or runs: `python benchmarks/run_all.py --cycles 100000 --runs 10`
 - All three compilers (`plc`, `iec2c`, `ironplcc`) must be installed to run the full suite.
+- CoV (coefficient of variation) is reported per run. Runs with CoV > 0.10 should be investigated for system noise (background processes, thermal throttling, etc.).
 
 ---
 
@@ -1188,18 +1388,23 @@ We evaluate IronPLC along two axes. The first is **correctness**: given a progra
 
 Programs were drawn from the RuSTy test suite and OpenPLC example library, vendored at pinned commits and listed with provenance in Table 1. All programs compile and execute correctly on RuSTy prior to use as IronPLC benchmarks.
 
-_Table 1: Benchmark suite._
+_Table 1: Benchmark suite. The "IEC Features" column references IEC 61131-3 language elements; together the suite covers variable declarations, assignments, arithmetic operators, comparison operators, IF/ELSE, FOR, CASE, function block instantiation and invocation, timers (TON), counters (CTU), and array indexing — the features used by the majority of real-world ST programs._
 
-|Program|Source|Key Features|
-|---|---|---|
-|Blinky|OpenPLC|Minimal coil; baseline VM overhead|
-|TON one-shot|RuSTy tests|Stateful function block, timer semantics|
-|Counter (CTU)|RuSTy tests|Stateful function block, reset|
-|Arithmetic|OSCAT / custom|ADD, SUB, MUL, LIMIT; verifiable outputs|
-|FOR accumulator|RuSTy tests|Loop control flow|
-|CASE state machine|OpenPLC|Branch-heavy control|
+|Program|Source|Key Features|Category|
+|---|---|---|---|
+|Noop|Custom|Empty body; timer calibration|Calibration|
+|Blinky|OpenPLC|Minimal coil; baseline VM overhead|Core|
+|TON one-shot|RuSTy tests|Stateful function block, timer semantics|Core|
+|Counter (CTU)|RuSTy tests|Stateful function block, reset|Core|
+|Arithmetic|OSCAT / custom|ADD, SUB, MUL, LIMIT; verifiable outputs|Core|
+|FOR accumulator|RuSTy tests|Loop control flow|Core|
+|CASE state machine|OpenPLC|Branch-heavy control|Core|
+|Nested FB|RuSTy tests|FB calling FB, multiple instances|Core|
+|Array sort|Custom|Array indexing, bubble sort|Core|
+|Large FB|Custom|10+ FB instances, 50+ variables|Scaled|
+|Array large|Custom|Bubble sort on 1000-element array|Scaled|
 
-Programs 1–4 form the minimum set required to validate the VM's arithmetic and stateful FB execution. Programs 5–6 extend coverage to control flow opcodes.
+Programs in the **Core** category form the primary evaluation set. The **Calibration** program (`noop.st`) quantifies timer and harness overhead. **Scaled** programs test whether overhead ratios remain stable as program size increases beyond L1 instruction cache capacity.
 
 ---
 
@@ -1207,15 +1412,19 @@ Programs 1–4 form the minimum set required to validate the VM's arithmetic and
 
 **Toolchains.** IronPLC compiles ST source to bytecode via `ironplcc compile` and executes via the `ironplcc bench` subcommand. RuSTy compiles the same ST source to a native shared library via `plc --shared`, which is then executed by a thin Rust harness that calls the program entry point in a loop. MATIEC transpiles the same ST source to ANSI C via `iec2c`, which is then compiled to a shared library by GCC and executed by an equivalent Rust harness. Both RuSTy and MATIEC are evaluated at two optimization levels: `-O0` (unoptimized, a fairer baseline that isolates the interpreter-vs-dispatch distinction from backend optimization) and `-O2` (production-grade, the realistic ceiling for native execution).
 
-**Measurement protocol.** Each program runs for 1,000 warmup cycles (unmeasured) followed by 10,000 measured cycles. Warmup stabilises instruction caches, data caches, branch predictors, and the timing infrastructure itself (each warmup cycle includes a no-op timer call to ensure the vDSO path is hot). Each benchmark configuration is executed for **5 independent runs**; we report the **median of run medians** as the primary result and the **min/max across runs** as the uncertainty range. This guards against transient system noise affecting a single run. All processes are pinned to a single CPU core via `sched_setaffinity`. We report mean, p50, p99, and max cycle time per run. **p99 is the primary metric** because it governs worst-case latency, which determines real-time deployability.
+**Measurement protocol.** Each program runs for 1,000 warmup cycles (unmeasured) followed by 10,000 measured cycles. Warmup stabilises instruction caches, data caches, branch predictors, and the timing infrastructure itself (each warmup cycle includes a no-op timer call to ensure the vDSO path is hot). Each benchmark configuration is executed for **5 independent runs**; we report the **median of run medians** as the primary result and the **min/max across runs** as the uncertainty range. This guards against transient system noise affecting a single run. We report mean, p50, p99, max cycle time, and **coefficient of variation** (CoV = stddev/mean) per run. **p99 is the primary metric** because it governs worst-case latency, which determines real-time deployability. A CoV below 0.05 confirms low scheduling noise; runs with CoV above 0.10 are flagged and re-run.
 
-**Timer resolution.** All harnesses use Rust's `std::time::Instant`, which maps to `clock_gettime(CLOCK_MONOTONIC)` on Linux. On modern x86-64, this has nanosecond resolution via the vDSO, with a call overhead of approximately 20–25 ns. For the fastest native-code benchmarks (RuSTy O2, expected ~100–200 ns per cycle), the timer overhead is 10–25% of the measured value. We mitigate this by: (a) reporting the overhead ratio IronPLC/native rather than absolute native times, since both measurements include the same timer overhead, and (b) including an empty-body calibration benchmark that measures the timer overhead in isolation, which is subtracted in the detailed analysis. If absolute sub-100 ns measurements are needed, an alternative approach using `rdtsc` with a calibrated frequency can be employed.
+**System isolation.** All benchmark processes are pinned to a single CPU core via `sched_setaffinity` and run under `SCHED_FIFO` real-time scheduling priority to minimize preemption by other processes. CPU frequency scaling is disabled during benchmark runs (`cpupower frequency-set -g performance`) to prevent frequency transitions from affecting measurements. These settings are documented in the reproducibility notes and enforced by the `--pin-cpu` and `--rt-priority` harness flags.
+
+**Timer resolution.** All harnesses use Rust's `std::time::Instant`, which maps to `clock_gettime(CLOCK_MONOTONIC)` on Linux. On modern x86-64, this has nanosecond resolution via the vDSO, with a call overhead of approximately 20–25 ns. For the fastest native-code benchmarks (RuSTy O2, expected ~100–200 ns per cycle), the timer overhead is 10–25% of the measured value. We mitigate this in three ways: (a) reporting the overhead ratio IronPLC/native rather than absolute native times, since both measurements include the same timer overhead; (b) including `noop.st`, an empty-body calibration benchmark that measures the timer overhead in isolation, reported alongside all results; and (c) providing a **batch timing** mode (`--batch-timing`) that places a single `Instant::now()` pair around the entire measurement loop, yielding accurate mean cycle times without per-cycle timer overhead. The per-cycle and batch means are reported side by side; the difference quantifies the timer overhead empirically.
 
 **Equivalence of measurement.** The IronPLC `bench` subcommand places `Instant::now()` calls outside `run_round`, so the VM executes identically to production. The RuSTy and MATIEC harnesses place equivalent timing calls outside the entry point call. All three harnesses use the same JSON report format; the summary table is generated by a single Python script consuming all results.
 
-**Correctness verification.** Each benchmark program is designed so that its final variable state after a fixed number of cycles is deterministic and analytically predictable (e.g., a counter incremented once per cycle reaches exactly 11,000 after 11,000 total cycles; a state machine cycling through 4 states lands on a known state). After each run, each harness captures the final variable state to JSON. `compare_outputs.py` verifies that all compilers (RuSTy, MATIEC, IronPLC) produce identical final values. A program passes only if all output variables agree across every compiler.
+**Correctness verification.** Each benchmark program is designed so that its final variable state after a fixed number of cycles is deterministic and analytically predictable (e.g., a counter incremented once per cycle reaches exactly 11,000 after 11,000 total cycles; a state machine cycling through 4 states lands on a known state). After each run, each harness captures the final variable state to JSON. `compare_outputs.py` mechanically verifies that all compilers (RuSTy, MATIEC, IronPLC) produce identical final values. A program passes only if all output variables agree across every compiler. For deeper semantic equivalence checking, the `--trace-every N` flag captures variable state at intermediate cycle intervals to a JSONL file, enabling cycle-by-cycle comparison across compilers — not just final state.
 
-**Hardware.** `<CPU model, core count, clock speed>`, `<RAM>`, `<OS and version>`, kernel `<version>`.
+**Program size reporting.** For each benchmark program, we report the IronPLC bytecode size (bytes), the RuSTy `.text` section size, and the MATIEC `.text` section size. This allows readers to assess whether programs fit within L1 instruction cache and to reason about how results might extrapolate to larger programs. The scaled variants (`large_fb.st`, `array_large.st`) are deliberately sized to exceed typical L1 icache (32–64 KB), testing whether overhead ratios remain stable under cache pressure.
+
+**Hardware.** `<CPU model, core count, clock speed>`, `<RAM>`, `<OS and version>`, kernel `<version>`. CPU frequency governor set to `performance` (fixed frequency). Results are additionally collected on a second platform (see Section 5.7).
 
 ---
 
@@ -1227,16 +1436,30 @@ All N programs in the benchmark suite produce identical output values when execu
 
 #### 5.5 Performance Results
 
-_Table 2: Per-cycle execution time (µs), 10,000 cycles × 5 runs. Values are median p50 across runs; parenthesized range shows min–max p50._
+_Table 2: Per-cycle execution time (µs), 10,000 cycles × 5 runs. Values are median p50 across runs; parenthesized range shows min–max p50. CoV column shows the coefficient of variation of the representative run._
 
-|Program|RuSTy -O2 p99|MATIEC -O2 p99|IronPLC p99|vs RuSTy|vs MATIEC|1 ms budget|
-|---|---|---|---|---|---|---|
-|Blinky||||||✓|
-|TON one-shot||||||✓|
-|Counter||||||✓|
-|Arithmetic||||||✓|
-|FOR loop||||||✓|
-|CASE state||||||✓|
+|Program|RuSTy -O2 p99|MATIEC -O2 p99|IronPLC p99|vs RuSTy|vs MATIEC|CoV|1 ms budget|
+|---|---|---|---|---|---|---|---|
+|Noop (calibration)||||||||
+|Blinky|||||||✓|
+|TON one-shot|||||||✓|
+|Counter|||||||✓|
+|Arithmetic|||||||✓|
+|FOR loop|||||||✓|
+|CASE state|||||||✓|
+|Nested FB|||||||✓|
+|Array sort|||||||✓|
+|Large FB (scaled)|||||||✓|
+|Array large (scaled)|||||||✓|
+
+_Table 3: Program size (bytes)._
+
+|Program|IronPLC bytecode|RuSTy .text (O2)|MATIEC .text (O2)|
+|---|---|---|---|
+|Blinky||||
+|...|...|...|...|
+|Large FB (scaled)||||
+|Array large (scaled)||||
 
 IronPLC's interpreted execution is Nx–Mx slower than RuSTy's LLVM-optimized native code and Ax–Bx slower than MATIEC's GCC-compiled C code (Table 2). This overhead is consistent with published comparisons between bytecode interpreters and native code in other domains. Despite this overhead, IronPLC's p99 cycle time remains below Y µs across all benchmark programs — well within the 1 ms cycle budget common in industrial PLC applications.
 
@@ -1250,15 +1473,42 @@ The comparison between RuSTy and MATIEC is also informative: RuSTy's LLVM backen
 
 **MATIEC as a baseline.** MATIEC represents the traditional open-source PLC compilation approach: transpile to C, then compile with a general-purpose C compiler. Its inclusion provides a second native-code reference point that reflects real-world industrial practice (OpenPLC uses this exact pipeline in production). The performance gap between RuSTy and MATIEC quantifies the benefit of purpose-built IR generation and LLVM optimization over the transpilation approach. For IronPLC, the overhead ratio against MATIEC is more representative of the "cost of interpretation" in practice, since MATIEC's compilation quality is closer to what deployed PLC runtimes achieve.
 
+**Scaling behaviour.** The scaled variants (`large_fb.st`, `array_large.st`) test whether overhead ratios hold as programs grow. If the IronPLC/native ratio is stable across core and scaled programs, this is evidence that the ratio will not change dramatically for larger real-world programs. If the ratio increases for scaled variants, this indicates cache pressure effects that are worth documenting. We plot overhead ratio vs. program size (Table 3) to make this trend visible.
+
 **Real-time viability.** The 1 ms cycle budget is conservative; non-safety-critical PLC applications commonly use 10–100 ms cycle times. At these rates, IronPLC's absolute cycle time is negligible and the interpretation overhead is immaterial. For hard real-time applications requiring sub-millisecond cycles, compilation-based approaches such as RuSTy remain preferable. IronPLC targets the large class of applications where interpreted execution is acceptable in exchange for the safety guarantees of all-safe-Rust execution, cross-platform portability, and the open-source tooling ecosystem.
 
-**Threats to validity.**
+---
 
-1. The benchmark programs are small; real PLC programs may be larger and exhibit different instruction cache behaviour.
-2. Measurements were taken on a general-purpose OS without real-time scheduling. Production deployments on PREEMPT_RT or dedicated hardware would see different absolute timings and lower variance.
-3. RuSTy, MATIEC, and IronPLC do not share a compiler front-end; the same ST source was compiled independently by each toolchain. Programs were manually verified to be semantically equivalent by comparing output traces.
-4. All benchmark programs were written to the intersection of ST features supported by RuSTy, MATIEC, and IronPLC. Programs requiring compiler-specific extensions (e.g., RuSTy-only features not supported by MATIEC's `iec2c`) were excluded from the suite at design time.
-5. Timer overhead (`clock_gettime` call cost of ~20–25 ns) is non-negligible relative to the fastest native-code cycle times (~100–200 ns). Since all harnesses use the same timer, the overhead cancels in ratio comparisons but inflates absolute native-code times. We report an empty-body calibration measurement to quantify this effect.
+#### 5.7 Cross-Platform Validation
+
+To assess whether overhead ratios are architecture-dependent, we repeat the full benchmark suite on a second hardware platform: `<ARM64 platform, e.g., Raspberry Pi 4 Model B, 4 GB RAM, aarch64 Linux>`. The same pinned compiler versions, harness binaries (cross-compiled), and automation scripts are used. We report the overhead ratios (IronPLC / RuSTy O2, IronPLC / MATIEC O2) on both platforms and compare.
+
+_Table 4: Overhead ratio stability across platforms._
+
+|Program|x86-64 vs RuSTy|ARM64 vs RuSTy|x86-64 vs MATIEC|ARM64 vs MATIEC|
+|---|---|---|---|---|
+|Blinky|||||
+|...|...|...|...|...|
+
+If overhead ratios are stable (within ±20%) across platforms, this supports the claim that the interpreter overhead is a function of instruction count and dispatch mechanism rather than ISA-specific effects. If ratios differ significantly, we discuss the architectural factors (e.g., branch prediction quality, memory latency) that contribute.
+
+---
+
+#### 5.8 Threats to Validity
+
+1. **Program size.** The core benchmark programs are small; real PLC programs may be larger and exhibit different instruction cache behaviour. _Mitigation:_ The scaled variants (`large_fb.st`, `array_large.st`) deliberately exceed L1 icache capacity. We report program sizes (Table 3) and plot overhead ratio vs. size to show the trend.
+
+2. **OS scheduling.** Measurements were taken on a general-purpose OS without a real-time kernel. Production deployments on PREEMPT_RT or dedicated hardware would see different absolute timings and lower variance. _Mitigation:_ All harnesses run under `SCHED_FIFO` real-time priority with CPU pinning and fixed-frequency governor. The coefficient of variation (CoV) is reported per run; runs with CoV > 0.10 are discarded and re-run. Multiple independent runs (5 per configuration) provide the uncertainty range.
+
+3. **Semantic equivalence.** RuSTy, MATIEC, and IronPLC do not share a compiler front-end; the same ST source was compiled independently by each toolchain. _Mitigation:_ `compare_outputs.py` mechanically verifies that all compilers produce identical final variable state. The `--trace-every` flag enables cycle-by-cycle intermediate state comparison across compilers, providing stronger equivalence evidence than final-state-only checking.
+
+4. **Feature intersection.** All benchmark programs were written to the intersection of ST features supported by RuSTy, MATIEC, and IronPLC. Programs requiring compiler-specific extensions were excluded from the suite at design time. _Mitigation:_ The suite covers the IEC 61131-3 features used by the majority of real-world ST programs: variable declarations, assignments, arithmetic/comparison operators, IF/ELSE, FOR, CASE, function block instantiation, timers (TON), counters (CTU), and array indexing.
+
+5. **Timer overhead.** `clock_gettime` call cost (~20–25 ns) is non-negligible relative to the fastest native-code cycle times (~100–200 ns). _Mitigation:_ (a) Overhead ratios cancel the timer cost since both measurements include it. (b) `noop.st` calibration benchmark quantifies timer overhead in isolation. (c) Batch timing mode provides accurate mean cycle times without per-cycle timer overhead; the difference between per-cycle and batch means empirically quantifies the effect.
+
+6. **Single hardware platform.** Overhead ratios might vary across CPU architectures due to differences in branch prediction, memory latency, or instruction decode width. _Mitigation:_ Section 5.7 repeats the full suite on a second platform (ARM64) and compares overhead ratios. The two optimization levels (O0/O2) also provide sensitivity analysis within a single platform.
+
+7. **Compiler version sensitivity.** RuSTy and MATIEC are actively developed; results may differ with future versions. _Mitigation:_ All compiler versions are pinned to specific commits and documented. The two optimization levels (O0 and O2) demonstrate sensitivity to backend optimization quality within the same compiler version.
 
 ---
 
@@ -1275,12 +1525,17 @@ Build in this sequence. Each step produces something independently useful and un
 |Step|Component|Deliverable|Unblocks|
 |---|---|---|---|
 |1|`ironplcc bench` (timing only)|Can measure IronPLC cycle time|Everything else|
-|2|RuSTy harness binary|Can measure RuSTy cycle time|Steps 4–10|
-|3|MATIEC harness + `matiec_compile.sh`|Can measure MATIEC cycle time|Steps 4–10|
+|2|RuSTy harness binary|Can measure RuSTy cycle time|Steps 4–14|
+|3|MATIEC harness + `matiec_compile.sh`|Can measure MATIEC cycle time|Steps 4–14|
 |4|CI pipeline (`benchmark.yml`)|E2E verification on every push|Continuous validation|
 |5|`run_benchmark.py`|Single command runs all three|Paper workflow|
 |6|`--capture-output` + `compare_outputs.py`|Final-state correctness verification|Section 5.4|
 |7|`report.py` + `summary_table.py`|Paper tables (three-way comparison)|Section 5.5|
-|8|Benchmark programs 6–8|Broader evaluation|Stronger paper|
-|9|MATIEC compatibility testing|Verify which programs compile on MATIEC|Accurate results table|
-|10|`README.md` + `SOURCES.md` + pinned commits|Reproducibility|Submission|
+|8|Core benchmark programs 6–8|Broader evaluation|Stronger paper|
+|9|MATIEC compatibility testing|Verify all programs compile on all three compilers|Accurate results table|
+|10|`noop.st` calibration + `--batch-timing`|Timer overhead quantification|Section 5.5 accuracy|
+|11|Scaled programs (`large_fb.st`, `array_large.st`) + `program_sizes.py`|Cache pressure analysis, Table 3|Section 5.6 scaling|
+|12|`--trace-every` + `compare_traces.py`|Cycle-by-cycle semantic equivalence|Section 5.4 strength|
+|13|`--rt-priority` + `SCHED_FIFO` + CoV reporting|Reduced scheduling noise, quality metric|Section 5.5 reliability|
+|14|Cross-platform run (ARM64)|Architecture-independent overhead ratios|Section 5.7|
+|15|`README.md` + `SOURCES.md` + pinned commits|Reproducibility|Submission|
