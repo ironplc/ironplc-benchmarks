@@ -68,7 +68,7 @@ RUN cargo install --git https://github.com/PLC-lang/rusty --rev ${RUSTY_REV} plc
 # Transpiles ST to ANSI C; the generated C is then compiled
 # to a shared library by GCC via matiec_compile.sh.
 # ------------------------------------------------------------
-ARG MATIEC_REV=2f0dc65
+ARG MATIEC_REV=2b595efea02c1a3ac1a095fb6bb4c0b34ba7046e
 RUN apt-get update && apt-get install -y --no-install-recommends flex bison \
     && rm -rf /var/lib/apt/lists/* \
     && git clone https://github.com/beremiz/matiec.git /opt/matiec \
