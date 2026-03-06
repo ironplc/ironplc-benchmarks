@@ -71,7 +71,7 @@ jobs:
 
       - name: Install RuSTy
         if: steps.cache-rusty.outputs.cache-hit != 'true'
-        run: cargo install --git https://github.com/PLC-lang/rusty --branch ${{ env.RUSTY_REV }} plc
+        run: cargo install --git https://github.com/PLC-lang/rusty --branch ${{ env.RUSTY_REV }} plc_driver
 
       - name: Cache MATIEC
         id: cache-matiec
