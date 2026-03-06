@@ -64,6 +64,25 @@ RUN cargo install --git https://github.com/PLC-lang/rusty --rev ${RUSTY_REV} plc
     && plc --version
 
 # ------------------------------------------------------------
+# MATIEC IEC 61131-3 compiler (iec2c binary)
+# Transpiles ST to ANSI C; the generated C is then compiled
+# to a shared library by GCC via matiec_compile.sh.
+# ------------------------------------------------------------
+ARG MATIEC_REV=2f0dc65
+RUN apt-get update && apt-get install -y --no-install-recommends flex bison \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone https://github.com/beremiz/matiec.git /opt/matiec \
+    && cd /opt/matiec \
+    && git checkout ${MATIEC_REV} \
+    && autoreconf -i \
+    && ./configure \
+    && make -j"$(nproc)" \
+    && ln -s /opt/matiec/iec2c /usr/local/bin/iec2c \
+    && iec2c --help 2>&1 | head -1
+
+ENV MATIEC_C_INCLUDE_PATH=/opt/matiec/lib/C
+
+# ------------------------------------------------------------
 # Python tooling
 # ------------------------------------------------------------
 RUN pip install --no-cache-dir ruff

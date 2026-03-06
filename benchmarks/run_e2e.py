@@ -47,6 +47,40 @@ def has_tool(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def generate_matiec_st(st_path: Path, out_dir: Path) -> Path:
+    """Generate a MATIEC-compatible ST file by appending CONFIGURATION wrapper.
+
+    MATIEC requires CONFIGURATION/RESOURCE/TASK/PROGRAM declarations that
+    RuSTy does not support. We read the original ST file, extract the
+    PROGRAM name, and append the required boilerplate.
+    """
+    content = st_path.read_text()
+
+    # Extract program name from "PROGRAM <name>"
+    program_name = None
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("PROGRAM "):
+            program_name = stripped.split()[1]
+            break
+
+    if not program_name:
+        raise ValueError(f"Could not find PROGRAM declaration in {st_path}")
+
+    wrapper = f"""
+
+CONFIGURATION config0
+    RESOURCE res0 ON PLC
+        TASK task0(INTERVAL := T#20ms, PRIORITY := 0);
+        PROGRAM inst0 WITH task0 : {program_name};
+    END_RESOURCE
+END_CONFIGURATION
+"""
+    matiec_st = out_dir / f"{st_path.stem}_matiec.st"
+    matiec_st.write_text(content + wrapper)
+    return matiec_st
+
+
 def discover_rusty_symbols(so_path: Path) -> tuple[str, str | None, str | None]:
     """Find entry, init, and instance symbols in a RuSTy .so via nm.
 
@@ -153,17 +187,24 @@ def compile_programs(st_files: list[Path], env: dict) -> dict[str, list[Path]]:
             else:
                 print(f"    FAIL: RuSTy -{opt}")
 
-        # MATIEC
+        # MATIEC — needs CONFIGURATION wrapper that RuSTy doesn't support
         if env["iec2c"]:
-            for opt in ("O0", "O2"):
-                so = OUT_DIR / f"{name}_matiec_{opt}.so"
-                r = run(
-                    [str(MATIEC_COMPILE), str(st), opt, str(so)],
-                )
-                if r.returncode == 0:
-                    compiled[name].append(so)
-                else:
-                    print(f"    SKIP: MATIEC -{opt} (incompatible)")
+            try:
+                matiec_st = generate_matiec_st(st, OUT_DIR)
+            except ValueError as e:
+                print(f"    SKIP: MATIEC — {e}")
+                matiec_st = None
+
+            if matiec_st:
+                for opt in ("O0", "O2"):
+                    so = OUT_DIR / f"{name}_matiec_{opt}.so"
+                    r = run(
+                        [str(MATIEC_COMPILE), str(matiec_st), opt, str(so)],
+                    )
+                    if r.returncode == 0:
+                        compiled[name].append(so)
+                    else:
+                        print(f"    SKIP: MATIEC -{opt} (incompatible)")
 
         # IronPLC
         if env["ironplcc"]:
