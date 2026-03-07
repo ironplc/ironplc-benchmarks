@@ -104,7 +104,7 @@ jobs:
 
       - name: Install IronPLC compiler (ironplcc)
         if: steps.cache-ironplc.outputs.cache-hit != 'true'
-        run: cargo install --git https://github.com/ironplc/ironplc --branch ${{ env.IRONPLC_REV }} plc2x
+        run: cargo install --git https://github.com/ironplc/ironplc --branch ${{ env.IRONPLC_REV }} ironplcc
 
       - name: Install IronPLC VM (ironplcvm)
         if: steps.cache-ironplc.outputs.cache-hit != 'true'
