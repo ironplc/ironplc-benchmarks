@@ -106,6 +106,25 @@ def discover_rusty_symbols(so_path: Path) -> tuple[str, str | None, str | None]:
     return entry, init, instance
 
 
+def normalize_ironplc_output(raw_json: str) -> str:
+    """Convert ironplcvm benchmark JSON to the common result format.
+
+    ironplcvm outputs scan_us:{mean, stddev, p99, max}.
+    The common format uses durations_us:{mean, p50, p99, min, max}.
+    """
+    data = json.loads(raw_json)
+    scan = data.pop("scan_us", {})
+    data["durations_us"] = {
+        "mean": scan.get("mean", 0.0),
+        "p50": scan.get("mean", 0.0),  # no p50 from ironplcvm; approximate with mean
+        "p99": scan.get("p99", 0.0),
+        "min": 0.0,  # not reported by ironplcvm
+        "max": scan.get("max", 0.0),
+    }
+    data.setdefault("opt_level", "vm")
+    return json.dumps(data, indent=2) + "\n"
+
+
 # ── Pipeline stages ─────────────────────────────────────────────────
 
 
@@ -143,6 +162,7 @@ def discover_environment() -> dict:
         "plc": has_tool("plc"),
         "iec2c": has_tool("iec2c") and MATIEC_COMPILE.exists(),
         "ironplcc": has_tool("ironplcc"),
+        "ironplcvm": has_tool("ironplcvm"),
         "rusty_harness": RUSTY_HARNESS.exists(),
         "matiec_harness": MATIEC_HARNESS.exists(),
     }
@@ -208,10 +228,10 @@ def compile_programs(st_files: list[Path], env: dict) -> dict[str, list[Path]]:
 
         # IronPLC
         if env["ironplcc"]:
-            plc_file = OUT_DIR / f"{name}.plc"
-            r = run(["ironplcc", "compile", str(st), "-o", str(plc_file)])
+            iplc_file = OUT_DIR / f"{name}.iplc"
+            r = run(["ironplcc", "compile", str(st), "-o", str(iplc_file)])
             if r.returncode == 0:
-                compiled[name].append(plc_file)
+                compiled[name].append(iplc_file)
             else:
                 print("    FAIL: IronPLC compile")
 
@@ -302,30 +322,29 @@ def run_benchmarks(
                     print(f"    FAIL: matiec-harness -{opt}: {r.stderr.strip()}")
 
         # IronPLC
-        if env["ironplcc"]:
-            plc_file = OUT_DIR / f"{name}.plc"
-            if plc_file.exists():
+        if env["ironplcvm"]:
+            iplc_file = OUT_DIR / f"{name}.iplc"
+            if iplc_file.exists():
                 out_json = result_dir / "ironplc.json"
                 r = run(
                     [
-                        "ironplcc",
-                        "bench",
-                        str(plc_file),
+                        "ironplcvm",
+                        "benchmark",
+                        str(iplc_file),
                         "--cycles",
                         str(cycles),
                         "--warmup",
                         str(warmup),
-                        "--report-format",
-                        "json",
                     ],
                     capture_output=True,
                     text=True,
                 )
                 if r.returncode == 0:
-                    out_json.write_text(r.stdout)
+                    normalized = normalize_ironplc_output(r.stdout)
+                    out_json.write_text(normalized)
                     result_files.append(out_json)
                 else:
-                    print(f"    FAIL: ironplcc bench: {r.stderr.strip()}")
+                    print(f"    FAIL: ironplcvm benchmark: {r.stderr.strip()}")
 
         print()
 

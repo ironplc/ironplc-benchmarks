@@ -16,6 +16,7 @@ env:
   LLVM_VER: "21"
   RUSTY_REV: "master" # TODO: pin to a specific commit hash
   MATIEC_REV: "master" # TODO: pin to a specific commit hash
+  IRONPLC_REV: "main" # TODO: pin to a specific commit hash
 
 jobs:
   benchmark:
@@ -90,6 +91,24 @@ jobs:
         run: |
           echo "/opt/matiec" >> "$GITHUB_PATH"
           echo "MATIEC_C_INCLUDE_PATH=/opt/matiec/lib/C" >> "$GITHUB_ENV"
+
+      # ── Install IronPLC ───────────────────────────────────
+      - name: Cache IronPLC binaries
+        id: cache-ironplc
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/ironplcc
+            ~/.cargo/bin/ironplcvm
+          key: ironplc-${{ env.IRONPLC_REV }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install IronPLC compiler (ironplcc)
+        if: steps.cache-ironplc.outputs.cache-hit != 'true'
+        run: cargo install --git https://github.com/ironplc/ironplc --branch ${{ env.IRONPLC_REV }} plc2x
+
+      - name: Install IronPLC VM (ironplcvm)
+        if: steps.cache-ironplc.outputs.cache-hit != 'true'
+        run: cargo install --git https://github.com/ironplc/ironplc --branch ${{ env.IRONPLC_REV }} ironplc-vm-cli
 
       # ── Cargo cache for harness builds (done by run_e2e.py) ──
       - name: Cache Cargo artifacts
