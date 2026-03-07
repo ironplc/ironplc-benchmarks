@@ -20,9 +20,7 @@ from pathlib import Path
 
 # Pinned versions — override via environment variables
 RUSTY_REV = os.environ.get("RUSTY_REV", "ebf72fb")
-MATIEC_REV = os.environ.get(
-    "MATIEC_REV", "2b595efea02c1a3ac1a095fb6bb4c0b34ba7046e"
-)
+MATIEC_REV = os.environ.get("MATIEC_REV", "2b595efea02c1a3ac1a095fb6bb4c0b34ba7046e")
 IRONPLC_REV = os.environ.get("IRONPLC_REV", "main")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -44,9 +42,12 @@ def install_rusty(force: bool) -> None:
         return
     run(
         [
-            "cargo", "install",
-            "--git", "https://github.com/PLC-lang/rusty",
-            "--rev", RUSTY_REV,
+            "cargo",
+            "install",
+            "--git",
+            "https://github.com/PLC-lang/rusty",
+            "--rev",
+            RUSTY_REV,
             "plc_driver",
         ]
     )
@@ -85,17 +86,23 @@ def install_ironplc(force: bool) -> None:
 
     run(
         [
-            "cargo", "install",
-            "--git", "https://github.com/ironplc/ironplc",
-            "--branch", IRONPLC_REV,
+            "cargo",
+            "install",
+            "--git",
+            "https://github.com/ironplc/ironplc",
+            "--branch",
+            IRONPLC_REV,
             "ironplcc",
         ]
     )
     run(
         [
-            "cargo", "install",
-            "--git", "https://github.com/ironplc/ironplc",
-            "--branch", IRONPLC_REV,
+            "cargo",
+            "install",
+            "--git",
+            "https://github.com/ironplc/ironplc",
+            "--branch",
+            IRONPLC_REV,
             "ironplc-vm-cli",
         ]
     )
@@ -116,8 +123,12 @@ def build_harnesses() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Install benchmark compilers and harnesses")
-    parser.add_argument("--force", action="store_true", help="Reinstall even if present")
+    parser = argparse.ArgumentParser(
+        description="Install benchmark compilers and harnesses"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Reinstall even if present"
+    )
     args = parser.parse_args()
 
     print("=" * 60)
