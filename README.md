@@ -24,27 +24,30 @@ PLAN.md              # Detailed benchmarking plan and paper outline
 
 ## Prerequisites
 
-**Option A — Docker (recommended)**
+**Option A — Dev Container (recommended)**
 
-Build and run the development container, which includes Python 3.12, Rust, and LLVM 21:
+Open this repository in VS Code with the Dev Containers extension. The container provides Python 3.12, Rust, and LLVM 21. Then install the compilers:
+
+```bash
+python setup.py
+```
+
+**Option B — Docker**
 
 ```bash
 docker build -t ironplc-bench .
 docker run --rm -it -v "$PWD":/workspace ironplc-bench
+python setup.py
 ```
-
-**Option B — Dev Container**
-
-Open this repository in VS Code with the Dev Containers extension. The `.devcontainer/devcontainer.json` configuration will build the same Docker image automatically.
 
 **Option C — Local setup**
 
-Install the following manually:
+Install the following manually, then run `python setup.py`:
 
 - Python 3.12+
 - Rust 1.90+ (via [rustup](https://rustup.rs))
 - LLVM 21 (required to compile RuSTy)
-- RuSTy `plc` compiler (see [PLC-lang/rusty](https://github.com/PLC-lang/rusty))
+- flex, bison, autoconf, automake, libtool (required to build MATIEC)
 
 ## Compiling ST programs to shared libraries
 
