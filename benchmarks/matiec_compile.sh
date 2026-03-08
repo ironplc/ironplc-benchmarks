@@ -8,7 +8,9 @@
 #
 # Requires:
 #   - iec2c on PATH
-#   - MATIEC_C_INCLUDE_PATH pointing to the MATIEC runtime headers
+#   - MATIEC_C_INCLUDE_PATH pointing to the MATIEC runtime C headers (lib/C/)
+#   - MATIEC_IEC_INCLUDE_PATH pointing to the MATIEC IEC library defs (lib/)
+#     (defaults to MATIEC_C_INCLUDE_PATH/../ if not set)
 #   - gcc
 
 set -euo pipefail
@@ -30,21 +32,29 @@ if [[ -z "${MATIEC_C_INCLUDE_PATH:-}" ]]; then
     exit 1
 fi
 
+# IEC library path (contains ieclib.txt etc.) — parent of the C headers dir
+MATIEC_IEC_INCLUDE_PATH="${MATIEC_IEC_INCLUDE_PATH:-$(dirname "${MATIEC_C_INCLUDE_PATH}")}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STUBS="${SCRIPT_DIR}/matiec_stubs.c"
+
 mkdir -p "$WORK"
 
 # Stage 1: ST → C via iec2c
+# -I points to the IEC library definitions (ieclib.txt), not the C headers
 echo "[matiec] ${NAME}: iec2c → ${WORK}/"
-iec2c -I "${MATIEC_C_INCLUDE_PATH}" -T "$WORK" "$ST_FILE"
+iec2c -I "${MATIEC_IEC_INCLUDE_PATH}" -T "$WORK" "$ST_FILE"
 
 # Stage 2: C → shared library via GCC
-# MATIEC generates: POUS.c, Res0.c, Config0.c (plus headers)
+# MATIEC generates config0.c, res0.c, and POUS.c. However res0.c does
+# #include "POUS.c" directly, so we must NOT compile POUS.c separately.
 echo "[matiec] ${NAME}: gcc -${OPT} → ${OUTPUT}"
 gcc -shared -fPIC "-${OPT}" \
     -I "$WORK" \
     -I "${MATIEC_C_INCLUDE_PATH}" \
-    "$WORK"/POUS.c \
-    "$WORK"/Res0.c \
-    "$WORK"/Config0.c \
+    "$WORK"/config0.c \
+    "$WORK"/res0.c \
+    "$STUBS" \
     -o "$OUTPUT" \
     -lm
 
