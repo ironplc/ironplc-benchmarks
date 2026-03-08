@@ -5,10 +5,10 @@
 PROGRAM counter_up
 VAR
     count : INT := 0;
-    limit : INT := 1000;
+    threshold : INT := 1000;
     reset_flag : BOOL := FALSE;
 END_VAR
-    IF count >= limit THEN
+    IF count >= threshold THEN
         count := 0;
         reset_flag := TRUE;
     ELSE
