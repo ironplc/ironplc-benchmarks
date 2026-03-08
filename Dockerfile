@@ -1,15 +1,17 @@
 # Dockerfile for IronPLC benchmark development
 #
-# Provides Python 3, Rust, and LLVM 21 (required to compile RuSTy).
+# Sets up the build environment (Rust, LLVM 21, Python, flex/bison).
+# Compilers (RuSTy, MATIEC, IronPLC) are installed separately via setup.sh.
+#
 # Usage:
 #   docker build -t ironplc-bench .
 #   docker run --rm -it -v "$PWD":/workspace ironplc-bench
+#   ./setup.sh          # install compilers (first time only)
 
 FROM python:3.12-bookworm
 
 ARG LLVM_VER=21
 ARG RUST_VERSION=1.90.0
-ARG RUSTY_REV=ebf72fb
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -32,6 +34,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget \
         zlib1g-dev \
         libzstd-dev \
+        flex \
+        bison \
+        autoconf \
+        automake \
+        libtool \
     && rm -rf /var/lib/apt/lists/*
 
 # ------------------------------------------------------------
@@ -55,32 +62,6 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal \
     && rustc --version && cargo --version
-
-# ------------------------------------------------------------
-# RuSTy IEC 61131-3 compiler (plc binary)
-# Pinned to a specific commit for reproducibility.
-# ------------------------------------------------------------
-RUN cargo install --git https://github.com/PLC-lang/rusty --rev ${RUSTY_REV} plc_driver \
-    && plc --version
-
-# ------------------------------------------------------------
-# MATIEC IEC 61131-3 compiler (iec2c binary)
-# Transpiles ST to ANSI C; the generated C is then compiled
-# to a shared library by GCC via matiec_compile.sh.
-# ------------------------------------------------------------
-ARG MATIEC_REV=2b595efea02c1a3ac1a095fb6bb4c0b34ba7046e
-RUN apt-get update && apt-get install -y --no-install-recommends flex bison \
-    && rm -rf /var/lib/apt/lists/* \
-    && git clone https://github.com/beremiz/matiec.git /opt/matiec \
-    && cd /opt/matiec \
-    && git checkout ${MATIEC_REV} \
-    && autoreconf -i \
-    && ./configure \
-    && make -j"$(nproc)" \
-    && ln -s /opt/matiec/iec2c /usr/local/bin/iec2c \
-    && iec2c --help 2>&1 | head -1
-
-ENV MATIEC_C_INCLUDE_PATH=/opt/matiec/lib/C
 
 # ------------------------------------------------------------
 # Python tooling

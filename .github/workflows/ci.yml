@@ -21,18 +21,12 @@ jobs:
         with:
           context: .
           push: false
-          load: true
           tags: ironplc-bench:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Compile ST programs to shared libraries
-        run: |
-          docker run --rm -v "$PWD":/workspace ironplc-bench:ci \
-            bash benchmarks/build_libs.sh
-
   build-harness:
-    name: Build benchmark harness
+    name: Build benchmark harnesses
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +41,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             benchmarks/rusty_harness/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('benchmarks/rusty_harness/Cargo.lock') }}
+            benchmarks/matiec_harness/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('benchmarks/rusty_harness/Cargo.lock', 'benchmarks/matiec_harness/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -55,8 +50,16 @@ jobs:
         working-directory: benchmarks/rusty_harness
         run: cargo build --release
 
-      - name: Run cargo clippy
+      - name: Clippy rusty-harness
         working-directory: benchmarks/rusty_harness
+        run: cargo clippy -- -D warnings
+
+      - name: Build matiec-harness
+        working-directory: benchmarks/matiec_harness
+        run: cargo build --release
+
+      - name: Clippy matiec-harness
+        working-directory: benchmarks/matiec_harness
         run: cargo clippy -- -D warnings
 
   lint:
