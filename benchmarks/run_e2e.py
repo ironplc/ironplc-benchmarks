@@ -15,7 +15,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -123,6 +125,262 @@ def normalize_ironplc_output(raw_json: str) -> str:
     }
     data.setdefault("opt_level", "vm")
     return json.dumps(data, indent=2) + "\n"
+
+
+# ── Variable parsing and output comparison ──────────────────────────
+
+# Supported IEC types for ctypes mapping
+IEC_TYPE_MAP = {"INT": "INT", "BOOL": "BOOL"}
+
+
+def parse_program_vars(st_path: Path) -> tuple[str, list[tuple[str, str]]]:
+    """Parse PROGRAM name and VAR declarations from a Structured Text file.
+
+    Returns (program_name, [(var_name, iec_type), ...]) in declaration order.
+    """
+    content = st_path.read_text()
+    program_name = None
+    variables: list[tuple[str, str]] = []
+
+    in_var_block = False
+    for line in content.splitlines():
+        stripped = line.strip()
+
+        if stripped.upper().startswith("PROGRAM "):
+            program_name = stripped.split()[1]
+            continue
+
+        if stripped == "VAR":
+            in_var_block = True
+            continue
+
+        if stripped == "END_VAR":
+            in_var_block = False
+            continue
+
+        if in_var_block:
+            # Match "name : TYPE" or "name : TYPE := value;"
+            m = re.match(r"(\w+)\s*:\s*(\w+)", stripped)
+            if m:
+                var_name = m.group(1).lower()
+                var_type = m.group(2).upper()
+                if var_type in IEC_TYPE_MAP:
+                    variables.append((var_name, var_type))
+
+    if not program_name:
+        raise ValueError(f"Could not find PROGRAM declaration in {st_path}")
+
+    return program_name, variables
+
+
+def _rusty_ctype(iec_type: str) -> type:
+    """Map an IEC type to its RuSTy ctypes equivalent (plain C types)."""
+    return {"INT": ctypes.c_int16, "BOOL": ctypes.c_uint8}[iec_type]
+
+
+def _matiec_ctype(iec_type: str) -> type:
+    """Map an IEC type to its MATIEC __IEC_<type>_t ctypes struct.
+
+    MATIEC wraps each variable in a struct { value_type value; uint8 flags; }.
+    """
+    value_ctype = {"INT": ctypes.c_int16, "BOOL": ctypes.c_uint8}[iec_type]
+
+    class IECVar(ctypes.Structure):
+        _fields_ = [("value", value_ctype), ("flags", ctypes.c_uint8)]
+
+    return IECVar
+
+
+def capture_rusty_vars(
+    program_name: str, variables: list[tuple[str, str]], scans: int
+) -> dict[str, int] | None:
+    """Run a RuSTy .so for N scans and return final variable values."""
+    so_path = OUT_DIR / f"{program_name}_O0.so"
+    if not so_path.exists():
+        return None
+
+    lib = ctypes.CDLL(str(so_path))
+
+    # Find instance global
+    instance_sym = f"{program_name}_instance"
+    try:
+        inst_addr = ctypes.addressof(ctypes.c_char.in_dll(lib, instance_sym))
+    except ValueError:
+        return None
+
+    # Init (no args — initializes the global)
+    init_sym = f"__init___{program_name}_st"
+    try:
+        init_fn = lib[init_sym]
+        init_fn.argtypes = []
+        init_fn()
+    except (OSError, AttributeError):
+        pass
+
+    # Run entry point
+    entry_fn = lib[program_name]
+    entry_fn.argtypes = [ctypes.c_void_p]
+    for _ in range(scans):
+        entry_fn(ctypes.c_void_p(inst_addr))
+
+    # Read struct fields (plain C types, natural packing)
+    fields = [(name, _rusty_ctype(typ)) for name, typ in variables]
+
+    class InstanceStruct(ctypes.Structure):
+        _fields_ = fields
+
+    inst = InstanceStruct.from_address(inst_addr)
+    return {name: int(getattr(inst, name)) for name, _ in variables}
+
+
+def capture_matiec_vars(
+    program_name: str, variables: list[tuple[str, str]], scans: int
+) -> dict[str, int] | None:
+    """Run a MATIEC .so for N scans and return final variable values."""
+    so_path = OUT_DIR / f"{program_name}_matiec_O0.so"
+    if not so_path.exists():
+        return None
+
+    lib = ctypes.CDLL(str(so_path))
+
+    # MATIEC uses global RES0__INST0
+    try:
+        inst_addr = ctypes.addressof(ctypes.c_char.in_dll(lib, "RES0__INST0"))
+    except ValueError:
+        return None
+
+    lib.config_init__()
+
+    config_run = lib.config_run__
+    config_run.argtypes = [ctypes.c_ulong]
+    for i in range(scans):
+        config_run(ctypes.c_ulong(i))
+
+    # Read struct: each field is __IEC_<type>_t = { value, flags }
+    result = {}
+    offset = 0
+    for name, typ in variables:
+        ct = _matiec_ctype(typ)
+        field = ct.from_address(inst_addr + offset)
+        result[name] = int(field.value)
+        offset += ctypes.sizeof(ct)
+    return result
+
+
+def capture_ironplc_vars(
+    program_name: str, variables: list[tuple[str, str]], scans: int
+) -> dict[str, int] | None:
+    """Run an IronPLC .iplc for N scans and return final variable values."""
+    iplc_path = OUT_DIR / f"{program_name}.iplc"
+    if not iplc_path.exists():
+        return None
+
+    dump_file = OUT_DIR / f"{program_name}_ironplc_dump.txt"
+    r = subprocess.run(
+        [
+            "ironplcvm",
+            "run",
+            "--scans",
+            str(scans),
+            "--dump-vars",
+            str(dump_file),
+            str(iplc_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return None
+
+    # Parse "var[N]: value" lines
+    raw_vals: dict[str, str] = {}
+    with open(dump_file) as f:
+        for line in f:
+            line = line.strip()
+            if ":" in line:
+                key, val = line.split(":", 1)
+                raw_vals[key.strip()] = val.strip()
+
+    # Map var[0], var[1], ... to variable names by declaration order
+    result = {}
+    for idx, (name, _) in enumerate(variables):
+        val_str = raw_vals.get(f"var[{idx}]", "")
+        try:
+            result[name] = int(val_str)
+        except ValueError:
+            if val_str.lower() in ("true", "1"):
+                result[name] = 1
+            elif val_str.lower() in ("false", "0"):
+                result[name] = 0
+            else:
+                result[name] = None
+
+    # Clean up dump file
+    dump_file.unlink(missing_ok=True)
+    return result
+
+
+COMPARISON_SCANS = 110
+
+
+def compare_outputs(st_files: list[Path], env: dict) -> bool:
+    """Compare final variable state across all compilers after a fixed scan count.
+
+    Returns True if all compilers produce identical output for every program.
+    """
+    all_match = True
+    header_printed = False
+
+    for st in st_files:
+        try:
+            program_name, variables = parse_program_vars(st)
+        except ValueError:
+            continue
+
+        if not variables:
+            continue
+
+        # Capture from each available compiler
+        captures: dict[str, dict[str, int] | None] = {}
+        captures["RuSTy"] = capture_rusty_vars(
+            program_name, variables, COMPARISON_SCANS
+        )
+        if env.get("iec2c"):
+            captures["MATIEC"] = capture_matiec_vars(
+                program_name, variables, COMPARISON_SCANS
+            )
+        if env.get("ironplcvm"):
+            captures["IronPLC"] = capture_ironplc_vars(
+                program_name, variables, COMPARISON_SCANS
+            )
+
+        # Filter to compilers that produced results
+        available = {k: v for k, v in captures.items() if v is not None}
+        if len(available) < 2:
+            print(f"  {program_name}: only {len(available)} compiler(s) — skipping")
+            continue
+
+        if not header_printed:
+            compilers = list(available.keys())
+            cols = "".join(f"{c:<12}" for c in compilers)
+            print(f"  {'Program':<14} {'Variable':<14} {cols}{'Match'}")
+            print("  " + "-" * (28 + 12 * len(compilers) + 8))
+            header_printed = True
+
+        compilers = list(available.keys())
+        for var_name, _ in variables:
+            vals = [available[c].get(var_name) for c in compilers]
+            match = len(set(vals)) == 1
+            if not match:
+                all_match = False
+            vals_str = "".join(f"{str(v):<12}" for v in vals)
+            status = "OK" if match else "MISMATCH"
+            print(f"  {program_name:<14} {var_name:<14} {vals_str}{status}")
+
+    if not header_printed:
+        print("  (no programs with parseable variables)")
+
+    return all_match
 
 
 # ── Pipeline stages ─────────────────────────────────────────────────
@@ -403,8 +661,8 @@ def validate_output_format(result_files: list[Path]) -> bool:
     return ok
 
 
-def compare_results(result_files: list[Path]) -> bool:
-    """Print side-by-side comparison and check final variable state."""
+def compare_results(result_files: list[Path]) -> None:
+    """Print side-by-side timing comparison of benchmark results."""
     programs = sorted(set(f.parent.name for f in result_files))
 
     for prog in programs:
@@ -441,44 +699,6 @@ def compare_results(result_files: list[Path]) -> bool:
                 ratio = dur["mean"] / rusty_o2["mean"]
                 print(f"    {label} vs rusty_O2: {ratio:.1f}x")
         print()
-
-    # Compare final variable state
-    all_pass = True
-    has_vars = False
-    for prog in programs:
-        var_files = sorted((RESULTS_DIR / prog).glob("*_vars.json"))
-        if len(var_files) < 2:
-            continue
-
-        has_vars = True
-        data = {}
-        for vf in var_files:
-            with open(vf) as fh:
-                data[vf.stem] = json.load(fh)
-
-        names = list(data.keys())
-        ref_name, ref_data = names[0], data[names[0]]
-        for other_name in names[1:]:
-            other_data = data[other_name]
-            mismatches = [
-                (var, ref_data[var], other_data.get(var))
-                for var in ref_data
-                if ref_data[var] != other_data.get(var)
-            ]
-            if mismatches:
-                all_pass = False
-                print(f"  FAIL  {prog}: {ref_name} vs {other_name}")
-                for var, exp, act in mismatches:
-                    print(f"        {var}: {exp} vs {act}")
-            else:
-                print(
-                    f"  PASS  {prog}: {ref_name} vs {other_name} ({len(ref_data)} vars)"
-                )
-
-    if not has_vars:
-        print("  (no variable capture files — final-state comparison skipped)")
-
-    return all_pass
 
 
 # ── Main ────────────────────────────────────────────────────────────
@@ -553,27 +773,34 @@ def main():
     print("=" * 60)
     format_ok = validate_output_format(result_files)
 
-    # ── 5. Compare ───────────────────────────────────────────────
+    # ── 5. Compare timing ────────────────────────────────────────
     print()
     print("=" * 60)
-    print("COMPARE RESULTS")
+    print("COMPARE TIMING")
     print("=" * 60)
-    compare_ok = compare_results(result_files)
+    compare_results(result_files)
+
+    # ── 6. Compare outputs ────────────────────────────────────────
+    print()
+    print("=" * 60)
+    print("COMPARE OUTPUTS")
+    print("=" * 60)
+    outputs_ok = compare_outputs(st_files, env)
 
     # ── Summary ──────────────────────────────────────────────────
     print()
     print("=" * 60)
     n = len(result_files)
-    if format_ok and compare_ok:
-        print(f"ALL PASSED — {n} result files validated")
+    if format_ok and outputs_ok:
+        print(f"ALL PASSED — {n} result files validated, outputs match")
     else:
         if not format_ok:
             print("FAILED — output format validation errors")
-        if not compare_ok:
-            print("FAILED — final-state comparison mismatches")
+        if not outputs_ok:
+            print("FAILED — compiler output mismatches")
     print("=" * 60)
 
-    sys.exit(0 if (format_ok and compare_ok) else 1)
+    sys.exit(0 if (format_ok and outputs_ok) else 1)
 
 
 if __name__ == "__main__":
