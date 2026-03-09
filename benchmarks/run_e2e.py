@@ -18,6 +18,7 @@ import argparse
 import ctypes
 import json
 import re
+import struct
 import shutil
 import subprocess
 import sys
@@ -130,7 +131,7 @@ def normalize_ironplc_output(raw_json: str) -> str:
 # ── Variable parsing and output comparison ──────────────────────────
 
 # Supported IEC types for ctypes mapping
-IEC_TYPE_MAP = {"INT": "INT", "BOOL": "BOOL"}
+IEC_TYPE_MAP = {"INT": "INT", "BOOL": "BOOL", "REAL": "REAL"}
 
 
 def parse_program_vars(st_path: Path) -> tuple[str, list[tuple[str, str]]]:
@@ -175,7 +176,11 @@ def parse_program_vars(st_path: Path) -> tuple[str, list[tuple[str, str]]]:
 
 def _rusty_ctype(iec_type: str) -> type:
     """Map an IEC type to its RuSTy ctypes equivalent (plain C types)."""
-    return {"INT": ctypes.c_int16, "BOOL": ctypes.c_uint8}[iec_type]
+    return {
+        "INT": ctypes.c_int16,
+        "BOOL": ctypes.c_uint8,
+        "REAL": ctypes.c_float,
+    }[iec_type]
 
 
 def _matiec_ctype(iec_type: str) -> type:
@@ -183,7 +188,11 @@ def _matiec_ctype(iec_type: str) -> type:
 
     MATIEC wraps each variable in a struct { value_type value; uint8 flags; }.
     """
-    value_ctype = {"INT": ctypes.c_int16, "BOOL": ctypes.c_uint8}[iec_type]
+    value_ctype = {
+        "INT": ctypes.c_int16,
+        "BOOL": ctypes.c_uint8,
+        "REAL": ctypes.c_float,
+    }[iec_type]
 
     class IECVar(ctypes.Structure):
         _fields_ = [("value", value_ctype), ("flags", ctypes.c_uint8)]
@@ -230,7 +239,11 @@ def capture_rusty_vars(
         _fields_ = fields
 
     inst = InstanceStruct.from_address(inst_addr)
-    return {name: int(getattr(inst, name)) for name, _ in variables}
+    result = {}
+    for name, typ in variables:
+        val = getattr(inst, name)
+        result[name] = float(val) if typ == "REAL" else int(val)
+    return result
 
 
 def capture_matiec_vars(
@@ -262,7 +275,7 @@ def capture_matiec_vars(
     for name, typ in variables:
         ct = _matiec_ctype(typ)
         field = ct.from_address(inst_addr + offset)
-        result[name] = int(field.value)
+        result[name] = float(field.value) if typ == "REAL" else int(field.value)
         offset += ctypes.sizeof(ct)
     return result
 
@@ -303,11 +316,17 @@ def capture_ironplc_vars(
 
     # Map var[0], var[1], ... to variable names by declaration order
     result = {}
-    for idx, (name, _) in enumerate(variables):
+    for idx, (name, typ) in enumerate(variables):
         val_str = raw_vals.get(f"var[{idx}]", "")
         try:
-            result[name] = int(val_str)
-        except ValueError:
+            if typ == "REAL":
+                # ironplcvm dumps REAL as raw IEEE 754 bits (int32)
+                raw_int = int(val_str)
+                b = struct.pack("<i", raw_int)
+                result[name] = struct.unpack("<f", b)[0]
+            else:
+                result[name] = int(val_str)
+        except (ValueError, struct.error):
             if val_str.lower() in ("true", "1"):
                 result[name] = 1
             elif val_str.lower() in ("false", "0"):
@@ -368,12 +387,21 @@ def compare_outputs(st_files: list[Path], env: dict) -> bool:
             header_printed = True
 
         compilers = list(available.keys())
-        for var_name, _ in variables:
+        for var_name, var_type in variables:
             vals = [available[c].get(var_name) for c in compilers]
-            match = len(set(vals)) == 1
+            if var_type == "REAL":
+                # Approximate comparison for floating-point
+                ref = vals[0]
+                match = all(
+                    v is not None and abs(v - ref) < 1e-4 * max(1.0, abs(ref))
+                    for v in vals
+                )
+                vals_str = "".join(f"{v:<12.4f}" for v in vals)
+            else:
+                match = len(set(vals)) == 1
+                vals_str = "".join(f"{str(v):<12}" for v in vals)
             if not match:
                 all_match = False
-            vals_str = "".join(f"{str(v):<12}" for v in vals)
             status = "OK" if match else "MISMATCH"
             print(f"  {program_name:<14} {var_name:<14} {vals_str}{status}")
 
