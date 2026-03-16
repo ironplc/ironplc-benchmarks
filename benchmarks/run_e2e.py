@@ -36,6 +36,28 @@ MATIEC_HARNESS = Path("benchmarks/matiec_harness/target/release/matiec-harness")
 MATIEC_COMPILE = Path("benchmarks/matiec_compile.sh")
 
 
+def find_rusty_stdlib() -> tuple[Path | None, Path | None]:
+    """Locate RuSTy's IEC 61131-3 standard library sources and compiled archive.
+
+    Returns (st_dir, lib_archive) where:
+    - st_dir: path to stdlib .st source files (for -i include)
+    - lib_archive: path to libiec61131std.a (for linking Rust-implemented functions)
+
+    The stdlib ships inside the Cargo git checkout used when
+    ``cargo install --git`` was run for plc_driver.
+    """
+    cargo_git = Path.home() / ".cargo" / "git" / "checkouts"
+    if not cargo_git.exists():
+        cargo_git = Path("/usr/local/cargo/git/checkouts")
+    for checkout in sorted(cargo_git.glob("rusty-*")):
+        for rev_dir in checkout.iterdir():
+            st_dir = rev_dir / "libs" / "stdlib" / "iec61131-st"
+            lib_a = rev_dir / "target" / "release" / "libiec61131std.a"
+            if st_dir.is_dir() and list(st_dir.glob("*.st")):
+                return st_dir, lib_a if lib_a.exists() else None
+    return None, None
+
+
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
@@ -83,7 +105,9 @@ END_CONFIGURATION
     return matiec_st
 
 
-def discover_rusty_symbols(so_path: Path) -> tuple[str, str | None, str | None]:
+def discover_rusty_symbols(
+    so_path: Path, program_name: str
+) -> tuple[str, str | None, str | None]:
     """Find entry, init, and instance symbols in a RuSTy .so via nm.
 
     Returns (entry, init, instance) where entry is the program function,
@@ -94,16 +118,18 @@ def discover_rusty_symbols(so_path: Path) -> tuple[str, str | None, str | None]:
         ["nm", "-D", str(so_path)], capture_output=True, text=True, check=True
     )
     entry, init, instance = None, None, None
+    instance_sym = f"{program_name}_instance"
+    init_prefix = f"__init___{program_name}_st"
     for line in result.stdout.splitlines():
         parts = line.split()
         if len(parts) == 3:
             sym = parts[2]
             if parts[1] == "T":
-                if "__init__" in sym:
+                if sym == init_prefix:
                     init = sym
-                elif not sym.startswith("_"):
-                    entry = entry or sym
-            elif parts[1] in ("B", "D") and sym.endswith("_instance"):
+                elif sym == program_name:
+                    entry = sym
+            elif parts[1] in ("B", "D") and sym == instance_sym:
                 instance = sym
     return entry, init, instance
 
@@ -130,7 +156,7 @@ def normalize_ironplc_output(raw_json: str) -> str:
 # ── Variable parsing and output comparison ──────────────────────────
 
 # Supported IEC types for ctypes mapping
-IEC_TYPE_MAP = {"INT": "INT", "BOOL": "BOOL"}
+IEC_TYPE_MAP = {"INT": "INT", "BOOL": "BOOL", "DINT": "DINT", "REAL": "REAL"}
 
 
 def parse_program_vars(st_path: Path) -> tuple[str, list[tuple[str, str]]]:
@@ -175,7 +201,12 @@ def parse_program_vars(st_path: Path) -> tuple[str, list[tuple[str, str]]]:
 
 def _rusty_ctype(iec_type: str) -> type:
     """Map an IEC type to its RuSTy ctypes equivalent (plain C types)."""
-    return {"INT": ctypes.c_int16, "BOOL": ctypes.c_uint8}[iec_type]
+    return {
+        "INT": ctypes.c_int16,
+        "BOOL": ctypes.c_uint8,
+        "DINT": ctypes.c_int32,
+        "REAL": ctypes.c_float,
+    }[iec_type]
 
 
 def _matiec_ctype(iec_type: str) -> type:
@@ -183,7 +214,12 @@ def _matiec_ctype(iec_type: str) -> type:
 
     MATIEC wraps each variable in a struct { value_type value; uint8 flags; }.
     """
-    value_ctype = {"INT": ctypes.c_int16, "BOOL": ctypes.c_uint8}[iec_type]
+    value_ctype = {
+        "INT": ctypes.c_int16,
+        "BOOL": ctypes.c_uint8,
+        "DINT": ctypes.c_int32,
+        "REAL": ctypes.c_float,
+    }[iec_type]
 
     class IECVar(ctypes.Structure):
         _fields_ = [("value", value_ctype), ("flags", ctypes.c_uint8)]
@@ -199,7 +235,10 @@ def capture_rusty_vars(
     if not so_path.exists():
         return None
 
-    lib = ctypes.CDLL(str(so_path))
+    try:
+        lib = ctypes.CDLL(str(so_path))
+    except OSError:
+        return None
 
     # Find instance global
     instance_sym = f"{program_name}_instance"
@@ -230,7 +269,11 @@ def capture_rusty_vars(
         _fields_ = fields
 
     inst = InstanceStruct.from_address(inst_addr)
-    return {name: int(getattr(inst, name)) for name, _ in variables}
+    result = {}
+    for name, typ in variables:
+        val = getattr(inst, name)
+        result[name] = round(float(val), 4) if typ == "REAL" else int(val)
+    return result
 
 
 def capture_matiec_vars(
@@ -241,7 +284,10 @@ def capture_matiec_vars(
     if not so_path.exists():
         return None
 
-    lib = ctypes.CDLL(str(so_path))
+    try:
+        lib = ctypes.CDLL(str(so_path))
+    except OSError:
+        return None
 
     # MATIEC uses global RES0__INST0
     try:
@@ -262,7 +308,8 @@ def capture_matiec_vars(
     for name, typ in variables:
         ct = _matiec_ctype(typ)
         field = ct.from_address(inst_addr + offset)
-        result[name] = int(field.value)
+        val = field.value
+        result[name] = round(float(val), 4) if typ == "REAL" else int(val)
         offset += ctypes.sizeof(ct)
     return result
 
@@ -303,10 +350,13 @@ def capture_ironplc_vars(
 
     # Map var[0], var[1], ... to variable names by declaration order
     result = {}
-    for idx, (name, _) in enumerate(variables):
+    for idx, (name, typ) in enumerate(variables):
         val_str = raw_vals.get(f"var[{idx}]", "")
         try:
-            result[name] = int(val_str)
+            if typ == "REAL":
+                result[name] = round(float(val_str), 4)
+            else:
+                result[name] = int(val_str)
         except ValueError:
             if val_str.lower() in ("true", "1"):
                 result[name] = 1
@@ -449,17 +499,57 @@ def compile_programs(st_files: list[Path], env: dict) -> dict[str, list[Path]]:
     OUT_DIR.mkdir(exist_ok=True)
     compiled: dict[str, list[Path]] = {}
 
+    # Locate RuSTy stdlib so standard functions (ABS, MIN, type conversions) resolve.
+    # Two-step build: compile .st → .o with -i (declarations), then link .o + .a → .so
+    rusty_stdlib_st, rusty_stdlib_a = find_rusty_stdlib()
+    rusty_include: list[str] = []
+    if rusty_stdlib_st:
+        rusty_include = ["-i", str(rusty_stdlib_st / "*.st")]
+        print(f"  RuSTy stdlib ST: {rusty_stdlib_st}")
+    else:
+        print("  WARN: RuSTy stdlib not found — standard functions may fail")
+    if rusty_stdlib_a:
+        print(f"  RuSTy stdlib lib: {rusty_stdlib_a}")
+    else:
+        print("  WARN: libiec61131std.a not found — run setup.py to build it")
+    print()
+
     for st in st_files:
         name = st.stem
         compiled[name] = []
         print(f"  Compile: {name}")
 
-        # RuSTy — plc uses -O none / -O default (not -O0 / -O2)
+        # RuSTy — two-step: compile to .o then link with stdlib .a
         OPT_FLAGS = {"O0": ["-O", "none"], "O2": ["-O", "default"]}
         for opt in ("O0", "O2"):
             so = OUT_DIR / f"{name}_{opt}.so"
-            cmd = ["plc", str(st), "--shared", *OPT_FLAGS[opt], "-o", str(so)]
+            obj = OUT_DIR / f"{name}_{opt}.o"
+
+            # Step 1: compile ST → object file
+            cmd = [
+                "plc",
+                str(st),
+                *rusty_include,
+                "-c",
+                *OPT_FLAGS[opt],
+                "-o",
+                str(obj),
+            ]
             r = run(cmd)
+            if r.returncode != 0:
+                print(f"    FAIL: RuSTy -{opt}")
+                continue
+
+            # Step 2: link object + stdlib archive → shared library
+            # Use cc (not ld.lld) so system libs like libgcc_s resolve automatically
+            link_cmd = ["cc", "-shared", str(obj)]
+            if rusty_stdlib_a:
+                link_cmd += [
+                    str(rusty_stdlib_a),
+                    "-Wl,--allow-multiple-definition",
+                ]
+            link_cmd += ["-lm", "-o", str(so)]
+            r = run(link_cmd)
             if r.returncode == 0:
                 compiled[name].append(so)
             else:
@@ -510,10 +600,14 @@ def run_benchmarks(
         result_dir.mkdir(parents=True, exist_ok=True)
         print(f"  Run: {name}")
 
-        # RuSTy
+        # RuSTy — discover entry/init/instance from the program name in the ST file
         o0_so = OUT_DIR / f"{name}_O0.so"
         if o0_so.exists() and env["rusty_harness"]:
-            entry, init, instance = discover_rusty_symbols(o0_so)
+            try:
+                prog_name, _ = parse_program_vars(st)
+            except ValueError:
+                prog_name = name
+            entry, init, instance = discover_rusty_symbols(o0_so, prog_name)
             if not entry:
                 print(f"    SKIP: could not find entry symbol in {o0_so}")
             elif not instance:

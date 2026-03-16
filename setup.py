@@ -35,22 +35,56 @@ def has_tool(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def find_rusty_checkout() -> Path | None:
+    """Find the RuSTy source checkout in Cargo's git cache."""
+    for base in [Path.home() / ".cargo", Path("/usr/local/cargo")]:
+        checkouts = base / "git" / "checkouts"
+        if not checkouts.exists():
+            continue
+        for checkout in sorted(checkouts.glob("rusty-*")):
+            for rev_dir in checkout.iterdir():
+                if (rev_dir / "libs" / "stdlib" / "Cargo.toml").exists():
+                    return rev_dir
+    return None
+
+
 def install_rusty(force: bool) -> None:
     print("[rusty]")
     if has_tool("plc") and not force:
         print("  already installed — skipping (use --force to reinstall)")
+    else:
+        run(
+            [
+                "cargo",
+                "install",
+                "--git",
+                "https://github.com/PLC-lang/rusty",
+                "--rev",
+                RUSTY_REV,
+                "plc_driver",
+            ]
+        )
+
+    # Build the stdlib as a static library (needed for linking benchmark .so files)
+    checkout = find_rusty_checkout()
+    if checkout is None:
+        print("  WARN: could not find RuSTy checkout — stdlib not built")
         return
-    run(
-        [
-            "cargo",
-            "install",
-            "--git",
-            "https://github.com/PLC-lang/rusty",
-            "--rev",
-            RUSTY_REV,
-            "plc_driver",
-        ]
-    )
+    stdlib_a = checkout / "target" / "release" / "libiec61131std.a"
+    if stdlib_a.exists() and not force:
+        print(f"  stdlib already built: {stdlib_a}")
+    else:
+        print("  building RuSTy stdlib...")
+        run(
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--manifest-path",
+                str(checkout / "libs" / "stdlib" / "Cargo.toml"),
+            ]
+        )
+        print(f"  stdlib built: {stdlib_a}")
 
 
 def install_matiec(force: bool) -> None:
