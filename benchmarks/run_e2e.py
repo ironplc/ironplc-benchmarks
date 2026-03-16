@@ -235,7 +235,10 @@ def capture_rusty_vars(
     if not so_path.exists():
         return None
 
-    lib = ctypes.CDLL(str(so_path))
+    try:
+        lib = ctypes.CDLL(str(so_path))
+    except OSError:
+        return None
 
     # Find instance global
     instance_sym = f"{program_name}_instance"
@@ -281,7 +284,10 @@ def capture_matiec_vars(
     if not so_path.exists():
         return None
 
-    lib = ctypes.CDLL(str(so_path))
+    try:
+        lib = ctypes.CDLL(str(so_path))
+    except OSError:
+        return None
 
     # MATIEC uses global RES0__INST0
     try:
