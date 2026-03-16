@@ -93,6 +93,10 @@ jobs:
           echo "MATIEC_C_INCLUDE_PATH=/opt/matiec/lib/C" >> "$GITHUB_ENV"
 
       # ── Install IronPLC ───────────────────────────────────
+      - name: Resolve IronPLC commit SHA
+        id: ironplc-sha
+        run: echo "sha=$(git ls-remote https://github.com/ironplc/ironplc refs/heads/${{ env.IRONPLC_REV }} | cut -f1)" >> "$GITHUB_OUTPUT"
+
       - name: Cache IronPLC binaries
         id: cache-ironplc
         uses: actions/cache@v4
@@ -100,7 +104,7 @@ jobs:
           path: |
             ~/.cargo/bin/ironplcc
             ~/.cargo/bin/ironplcvm
-          key: ironplc-${{ env.IRONPLC_REV }}-${{ runner.os }}-${{ runner.arch }}
+          key: ironplc-${{ steps.ironplc-sha.outputs.sha }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install IronPLC compiler (ironplcc)
         if: steps.cache-ironplc.outputs.cache-hit != 'true'
