@@ -7,7 +7,7 @@ test programs, compiles with ironplcc (and optionally RuSTy), and reports
 which functions compile successfully.
 
 Usage:
-    # Test all functions with IronPLC only
+    # Test all functions with IronPLC (includes full oscat.st for dependencies)
     python benchmarks/ironplc_compat.py
 
     # Also compile with RuSTy for comparison
@@ -16,8 +16,8 @@ Usage:
     # Test specific functions
     python benchmarks/ironplc_compat.py --functions BINOM FIB GCD
 
-    # Include full oscat.st to resolve cross-function dependencies
-    python benchmarks/ironplc_compat.py --full
+    # Test each function in isolation (without full oscat.st)
+    python benchmarks/ironplc_compat.py --no-full
 
     # Save JSON report
     python benchmarks/ironplc_compat.py --output report.json
@@ -304,21 +304,42 @@ def compile_ironplc(st_path: Path, out_dir: Path) -> tuple[bool, str]:
     """Compile with ironplcc. Returns (success, error_message)."""
     iplc = out_dir / f"{st_path.stem}.iplc"
     r = subprocess.run(
-        ["ironplcc", "compile", str(st_path), "-o", str(iplc)],
+        [
+            "ironplcc", "compile",
+            "--std-iec-61131-3", "2013",
+            "--allow-missing-semicolon",
+            "--allow-top-level-var-global",
+            "--allow-constant-type-params",
+            str(st_path), "-o", str(iplc),
+        ],
         capture_output=True,
         text=True,
     )
     if r.returncode == 0:
         return True, ""
-    # Extract a concise error from stderr
-    error = r.stderr.strip()
-    # Try to find the key error line
+    # Strip all ANSI codes from stderr
+    error = re.sub(r"\x1b\[[0-9;]*m", "", r.stderr).strip()
+    # Collect all relevant error lines (error code + detail)
+    error_line = ""
+    detail_line = ""
     for line in error.splitlines():
         line = line.strip()
-        # Strip ANSI codes
-        clean = re.sub(r"\x1b\[[0-9;]*m", "", line)
-        if "Not implemented" in clean or "error" in clean.lower():
-            return False, clean
+        if not line:
+            continue
+        if "Not implemented" in line:
+            detail_line = line
+        elif re.match(r"error\[P\d+\]", line):
+            error_line = line
+    # Prefer "Not implemented at ..." which includes the compile.rs location
+    if detail_line:
+        return False, detail_line
+    if error_line:
+        return False, error_line
+    # Fallback: terminal swallowing errors or other
+    for line in error.splitlines():
+        line = line.strip()
+        if line and "error" in line.lower():
+            return False, line[:200]
     return False, error[:200] if error else "unknown error"
 
 
@@ -427,22 +448,31 @@ def print_report(results: list[TestResult], show_rusty: bool) -> None:
     if iron_fail:
         print()
         print("  IronPLC failure patterns:")
-        patterns: dict[str, int] = {}
+        patterns: dict[str, list[str]] = {}
         for r in iron_fail:
             err = r.ironplc_error
             if "Not implemented" in err:
                 m = re.search(r"Not implemented at (.+)", err)
-                key = f"Not implemented: {m.group(1)}" if m else "Not implemented"
-            elif "Syntax error" in err or "parsing" in err.lower():
-                key = "Parse error"
-            elif "Unmatched character" in err:
-                key = "Unmatched character"
+                key = f"Not implemented: {m.group(1)}" if m else "Not implemented (unknown location)"
+            elif "Syntax error" in err or "P0002" in err:
+                key = "Parse/syntax error (P0002)"
+            elif "Unmatched character" in err or "P0003" in err:
+                key = "Unmatched character (P0003)"
+            elif "P0010" in err:
+                key = "Edition 3 feature (P0010)"
+            elif "Failed writing to terminal" in err:
+                key = "Terminal error (real error hidden)"
             else:
-                key = err[:60] if err else "unknown"
-            patterns[key] = patterns.get(key, 0) + 1
+                key = err[:80] if err else "unknown"
+            patterns.setdefault(key, []).append(r.name)
 
-        for pattern, count in sorted(patterns.items(), key=lambda x: -x[1]):
+        for pattern, names in sorted(patterns.items(), key=lambda x: -len(x[1])):
+            count = len(names)
+            examples = ", ".join(names[:5])
+            if count > 5:
+                examples += f", ... (+{count - 5} more)"
             print(f"    {count:3d}x  {pattern}")
+            print(f"          e.g. {examples}")
 
     print()
 
@@ -485,14 +515,19 @@ def main():
         help="Also compile with RuSTy for comparison",
     )
     parser.add_argument(
-        "--full",
+        "--no-full",
         action="store_true",
-        help="Include full oscat.st to resolve cross-function dependencies",
+        help="Test each function in isolation (without full oscat.st)",
     )
     parser.add_argument(
         "--output",
         metavar="PATH",
         help="Save JSON report to file",
+    )
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="Keep generated .st files in compat_out/ for inspection",
     )
     args = parser.parse_args()
 
@@ -525,8 +560,9 @@ def main():
             print("No matching functions found")
             sys.exit(1)
 
-    # Load full source if needed
-    full_source = OSCAT_ST.read_text() if args.full else None
+    # Include full oscat.st by default to resolve cross-function dependencies.
+    # The compiler is expected to tree-shake unreferenced functions.
+    full_source = None if args.no_full else OSCAT_ST.read_text()
 
     # Set up temp directory
     tmp_dir = Path("compat_out")
@@ -575,8 +611,9 @@ def main():
         save_json_report(results, Path(args.output))
         print(f"JSON report saved: {args.output}")
 
-    # Clean up
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+    # Clean up unless --keep
+    if not args.keep:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
