@@ -168,13 +168,13 @@ def _parse_function_block(source: str, line_number: int) -> FunctionDef | None:
         stripped = line.strip()
         upper = stripped.upper()
 
-        if upper == "VAR_INPUT":
+        if upper.startswith("VAR_INPUT"):
             in_var_input = True
             continue
         if upper.startswith("END_VAR"):
             in_var_input = False
             continue
-        if upper in ("VAR", "VAR_OUTPUT", "VAR_IN_OUT", "VAR_TEMP"):
+        if re.match(r"VAR\b|VAR_OUTPUT|VAR_IN_OUT|VAR_TEMP", upper):
             in_var_input = False
             continue
 
@@ -306,10 +306,7 @@ def compile_ironplc(st_path: Path, out_dir: Path) -> tuple[bool, str]:
     r = subprocess.run(
         [
             "ironplcc", "compile",
-            "--std-iec-61131-3", "2013",
-            "--allow-missing-semicolon",
-            "--allow-top-level-var-global",
-            "--allow-constant-type-params",
+            "--dialect", "rusty",
             str(st_path), "-o", str(iplc),
         ],
         capture_output=True,

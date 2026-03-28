@@ -487,7 +487,7 @@ def compile_programs(st_files: list[Path], env: dict) -> dict[str, list[Path]]:
         # IronPLC
         if env["ironplcc"]:
             iplc_file = OUT_DIR / f"{name}.iplc"
-            r = run(["ironplcc", "compile", str(st), "-o", str(iplc_file)])
+            r = run(["ironplcc", "compile", "--dialect", "rusty", str(st), "-o", str(iplc_file)])
             if r.returncode == 0:
                 compiled[name].append(iplc_file)
             else:
