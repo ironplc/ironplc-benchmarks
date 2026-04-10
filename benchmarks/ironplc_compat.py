@@ -526,6 +526,11 @@ def main():
         action="store_true",
         help="Keep generated .st files in compat_out/ for inspection",
     )
+    parser.add_argument(
+        "--lib",
+        metavar="PATH",
+        help="Prepend a compatibility library .st file before oscat.st",
+    )
     args = parser.parse_args()
 
     if not OSCAT_ST.exists():
@@ -560,6 +565,15 @@ def main():
     # Include full oscat.st by default to resolve cross-function dependencies.
     # The compiler is expected to tree-shake unreferenced functions.
     full_source = None if args.no_full else OSCAT_ST.read_text()
+
+    # Prepend compatibility library if specified
+    if full_source and args.lib:
+        lib_path = Path(args.lib)
+        if not lib_path.exists():
+            print(f"ERROR: {lib_path} not found")
+            sys.exit(1)
+        lib_source = lib_path.read_text()
+        full_source = lib_source + "\n" + full_source
 
     # Set up temp directory
     tmp_dir = Path("compat_out")
